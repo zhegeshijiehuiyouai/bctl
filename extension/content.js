@@ -1,15 +1,27 @@
-// --- ChatGPT 同款弹簧物理鼠标、Tab 栏光标 Favicon 与后台控制视觉层 ---
-let overlayRoot = null;
-let cursorWrapper = null;
-let cursorImg = null;
-let indicatorPill = null;
+(() => {
+  // ─── 幂等防重与历史资源清理 ───
+  if (window.__bctl_message_listener__) {
+    try {
+      chrome.runtime.onMessage.removeListener(window.__bctl_message_listener__);
+    } catch (_) {}
+  }
+  const oldOverlay = document.getElementById("bctl-agent-overlay-root");
+  if (oldOverlay) {
+    oldOverlay.remove();
+  }
 
-let cursorX = window.innerWidth / 2;
-let cursorY = window.innerHeight / 2;
-let isControlling = false;
+  // --- ChatGPT 同款弹簧物理鼠标、Tab 栏光标 Favicon 与后台控制视觉层 ---
+  let overlayRoot = null;
+  let cursorWrapper = null;
+  let cursorImg = null;
+  let indicatorPill = null;
 
-// 1. ChatGPT 官方原版标签页图标光标（在 Chrome 原生 Tab 栏渲染鼠标箭头）
-const CHATGPT_CURSOR_PATH = "M3.04536 4.45259C2.7582 3.60299 3.60299 2.7582 4.45259 3.04536L14.1828 6.33403C15.1637 6.66558 15.0872 8.08006 14.0715 8.39045L10.2994 9.54319C9.93919 9.65327 9.65327 9.93919 9.54319 10.2994L8.39046 14.0715C8.08007 15.0872 6.66558 15.1637 6.33404 14.1828L3.04536 4.45259Z";
+  let cursorX = window.innerWidth / 2;
+  let cursorY = window.innerHeight / 2;
+  let isControlling = false;
+
+  // 1. ChatGPT 官方原版标签页图标光标（在 Chrome 原生 Tab 栏渲染鼠标箭头）
+  const CHATGPT_CURSOR_PATH = "M3.04536 4.45259C2.7582 3.60299 3.60299 2.7582 4.45259 3.04536L14.1828 6.33403C15.1637 6.66558 15.0872 8.08006 14.0715 8.39045L10.2994 9.54319C9.93919 9.65327 9.65327 9.93919 9.54319 10.2994L8.39046 14.0715C8.08007 15.0872 6.66558 15.1637 6.33404 14.1828L3.04536 4.45259Z";
 
 function applyTabFaviconArrow() {
   try {
@@ -391,7 +403,7 @@ function scanElements() {
 }
 
 // --- 5. 监听来自 Background 的请求 ---
-chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  const messageListener = (req, sender, sendResponse) => {
   // 关键防死锁：优先同步响应 ping 请求！
   if (req.action === "ping") {
     sendResponse({ ok: true, pong: true });
@@ -508,4 +520,9 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     }
   })();
   return true;
-});
+};
+
+  chrome.runtime.onMessage.addListener(messageListener);
+  window.__bctl_message_listener__ = messageListener;
+})();
+
