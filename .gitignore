@@ -1,0 +1,5 @@
+node_modules/
+daemon.log
+*.log
+.DS_Store
+.env

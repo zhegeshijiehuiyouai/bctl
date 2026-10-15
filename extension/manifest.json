@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Ghost Cursor Browser Bridge Pro",
+  "version": "2.2.0",
+  "description": "为本地 AI Agent 提供日常 Chrome 控制、JumpServer 终端直连、后台无干扰并发与 ChatGPT 官方同款原生鼠标",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": ["<all_urls>"],
+      "resources": ["images/cursor-chat.png"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ]
+}
