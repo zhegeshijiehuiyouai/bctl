@@ -1,15 +1,28 @@
 let ws = null;
 const WS_URL = "ws://127.0.0.1:9223";
 
-// 1. 保活报警器（MV3 Service Worker 闲置 30 秒休眠防断连）
+const CONTROL_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟超时兜底
+
+// 1. 保活报警器（MV3 Service Worker 闲置 30 秒休眠防断连，兼顾 10 分钟闲置超时兜底）
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.3 });
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "keepAlive") {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectWS();
     } else {
       ws.send(JSON.stringify({ type: "pong" }));
     }
+
+    // 10 分钟超时兜底：检查是否超过 10 分钟未收到大模型任何操作
+    try {
+      const { boundTabId, lastActivityTime } = await chrome.storage.session.get(["boundTabId", "lastActivityTime"]);
+      if (boundTabId && lastActivityTime && (Date.now() - lastActivityTime > CONTROL_TIMEOUT_MS)) {
+        console.log(`[bctl] 超过 10 分钟无大模型操作，触发超时兜底自动解绑标签页: ${boundTabId}`);
+        chrome.tabs.sendMessage(boundTabId, { action: "hide_control_state" }).catch(() => {});
+        await chrome.tabs.update(boundTabId, { autoDiscardable: true }).catch(() => {});
+        await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
+      }
+    } catch (_) {}
   }
 });
 
@@ -100,8 +113,8 @@ async function connectWS() {
           return;
         }
 
-        // 保存至 session 存储，防止 Service Worker 唤醒时丢失
-        await chrome.storage.session.set({ boundTabId: matchedTab.id });
+        // 保存至 session 存储，防止 Service Worker 唤醒时丢失，同时记录当前活跃时间戳
+        await chrome.storage.session.set({ boundTabId: matchedTab.id, lastActivityTime: Date.now() });
         // 禁止 Chrome 后台休眠丢弃该标签页
         await chrome.tabs.update(matchedTab.id, { autoDiscardable: false }).catch(() => {});
         // 激活 ChatGPT 同款中央光标与控制胶囊 + Tab 图标光标
@@ -118,7 +131,7 @@ async function connectWS() {
       // ─── 动作 2.5: 在后台静默打开新标签页 (bctl new <url>) ───
       if (action === "new") {
         const newTab = await chrome.tabs.create({ url: payload.url, active: false });
-        await chrome.storage.session.set({ boundTabId: newTab.id });
+        await chrome.storage.session.set({ boundTabId: newTab.id, lastActivityTime: Date.now() });
         await chrome.tabs.update(newTab.id, { autoDiscardable: false }).catch(() => {});
 
         await waitForTabLoad(newTab.id);
@@ -135,11 +148,14 @@ async function connectWS() {
         if (boundTabId) {
           chrome.tabs.sendMessage(boundTabId, { action: "hide_control_state" }).catch(() => {});
           await chrome.tabs.update(boundTabId, { autoDiscardable: true }).catch(() => {});
-          await chrome.storage.session.remove("boundTabId");
+          await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
         }
         ws.send(JSON.stringify({ id, result: "已成功解除标签页绑定，指示胶囊与 Tab 栏图标已恢复正常" }));
         return;
       }
+
+      // 刷新活跃时间戳
+      chrome.storage.session.set({ lastActivityTime: Date.now() }).catch(() => {});
 
       // 获取当前控制目标 Tab（优先使用绑定的后台 Tab）
       const targetTab = await getTargetTab();
@@ -415,7 +431,7 @@ chrome.tabs.onRemoved.addListener(async (closedTabId) => {
   try {
     const { boundTabId } = await chrome.storage.session.get("boundTabId");
     if (closedTabId === boundTabId) {
-      await chrome.storage.session.remove("boundTabId");
+      await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
     }
   } catch (_) {}
 });
