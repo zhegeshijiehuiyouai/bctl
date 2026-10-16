@@ -24,7 +24,7 @@
   - 使用 `bctl new <url>` 在后台静默创建标签页并自动绑定，前台人类正在浏览的网页**绝不切页、绝不夺取焦点**。
   - 大模型在后台标签页自由执行点击、滚动、表单提交，人类在前台正常打字聊天，互不干扰。
 - **⚡ JumpServer 堡垒机 Web 终端直连穿透 (`bctl exec`)**：
-  - 直连 JumpServer (Luna/Koko) 的 xterm.js 实例，支持跨 iframe 递归探测、软折行（isWrapped）还原拼接、防后台休眠与动态 Token 退出码捕获，毫秒级返回干净的标准输出。
+  - 直连 JumpServer (Luna/Koko) 的 xterm.js 实例，支持跨 iframe 递归探测、软折行（isWrapped）还原拼接、防后台休眠与纯净原样命令下发（无 `BCTL_S` / `BCTL_E` 标记污染），毫秒级返回干净的标准输出。
 - **🎯 ChatGPT 同款视觉与弹簧阻尼光标**：
   - 复刻 ChatGPT 原版 `cursor-chat` 鼠标图标与顶部 `[AI Agent 正在控制此标签页]` 状态胶囊。
   - 动态在 Chrome 原生 Tab 栏 Favicon 上绘制绿色鼠标箭头，受控状态一目了然。
@@ -115,6 +115,38 @@ bctl status
 }
 ```
 
+### 5. 安装 Agent Skill
+
+大模型通过仓库里的 [`skills/chrome-control/SKILL.md`](skills/chrome-control/SKILL.md) 学会使用 `bctl`。技能只有这一份，安装脚本把它链接到 Cursor、Claude Code、Codex、Trae、Gemini 的个人 skills 目录。`git pull` 更新仓库后，各 Agent 读到的仍是这一份。
+
+在仓库根目录执行：
+
+macOS / Linux：
+
+```bash
+bash scripts/install-skill.sh
+```
+
+Windows（PowerShell，目录联接不需要管理员）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
+```
+
+脚本会把 `skills/chrome-control` 链到下面这些目录。Claude Code 或 Gemini 的 `skills` 目录如果已经整体指向 `~/.agents/skills`，对应的那一次链接和共用目录是同一个位置。
+
+| Agent | macOS / Linux | Windows |
+| :--- | :--- | :--- |
+| 共用目录 | `~/.agents/skills/chrome-control` | `%USERPROFILE%\.agents\skills\chrome-control` |
+| Cursor | `~/.cursor/skills/chrome-control` | `%USERPROFILE%\.cursor\skills\chrome-control` |
+| Claude Code | `~/.claude/skills/chrome-control` | `%USERPROFILE%\.claude\skills\chrome-control` |
+| Codex | `~/.codex/skills/chrome-control` | `%USERPROFILE%\.codex\skills\chrome-control` |
+| Trae 国际版 | `~/.trae/skills/chrome-control` | `%USERPROFILE%\.trae\skills\chrome-control` |
+| Trae 国内版 | `~/.trae-cn/skills/chrome-control` | `%USERPROFILE%\.trae-cn\skills\chrome-control` |
+| Gemini | `~/.gemini/config/skills/chrome-control` | `%USERPROFILE%\.gemini\config\skills\chrome-control` |
+
+装好后新开一轮对话。之后让 Agent 操作浏览器或 JumpServer 终端时，它会按这个 skill 调用 `bctl`。
+
 ---
 
 ## 💻 常用命令与速查表
@@ -173,28 +205,6 @@ bctl act '[{"type":"scroll","deltaY":800}]'
 
 # 3. 查看当前视口提取的表格数据与图表指标
 bctl look
-```
-
----
-
-## 🤖 大模型集成规则 (Agent Prompt)
-
-如果你正在使用 **Trae / Codex / Claude Code / Cursor / Antigravity**，可以直接将以下内容贴入你的 Agent 全局规则（如 `AGENTS.md`、`.cursorrules` 或全局系统提示词中）：
-
-```markdown
-# 浏览器控制指令规则 (bctl)
-
-当你需要操作浏览器、检索交互网页，或在 JumpServer 堡垒机上执行命令时，请直接在终端执行 `bctl` 命令：
-1. 查看所有打开的标签页: `bctl tabs`
-2. 锁定后台标签页 (避免夺取用户前台焦点): `bctl bind <关键词|TabID>` （如 `bctl bind jumpserver`）
-3. 在后台静默打开新网页: `bctl new <url>`
-4. 在 JumpServer 终端执行命令: `bctl exec "<shell命令>"` （如 `bctl exec "ps -ef | grep jenkins"`）
-5. 观察当前页面视口元素与数据: `bctl look`
-6. 打开网址: `bctl open <url>`
-7. 执行普通网页动作: `bctl act '<JSON动作数组>'`
-   - 点击/输入示例: `bctl act '[{"type":"type","id":1,"text":"mac mini"},{"type":"press","key":"Enter"}]'`
-   - 滚动页面示例: `bctl act '[{"type":"scroll","deltaY":600}]'` 或 `bctl act '[{"type":"scroll","direction":"down"}]'`
-8. 刷新扩展: `bctl reload`
 ```
 
 ---

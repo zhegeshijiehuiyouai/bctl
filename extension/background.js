@@ -292,11 +292,11 @@ function waitForTabLoad(tabId) {
 }
 
 // ─── MAIN 世界直连 JumpServer (Koko) xterm 实例的注入函数 ───
-// 包含了 Gemini 4 确认的 5 项关键边界防御：
+// 关键边界防御：
 // 1. 鸭子类型递归探查 Vue 2 / Vue 3 / window.term
-// 2. printf 动态 Token 防回显截断与退出码捕获
-// 3. isWrapped 软折行拼接还原
-// 4. term.onWriteParsed 事件监听防后台休眠节流
+// 2. 纯净原样命令下发（零 __BCTL_S_ / __BCTL_E_ 标记污染），基于光标行与提示符静默稳定检测完成态
+// 3. isWrapped 软折行拼接还原 + 环形缓冲区 onTrim 滚屏偏移追踪
+// 4. term.onWriteParsed 事件监听配合轮询防后台休眠节流
 // 5. triggerDataEvent 绕过 Bracketed Paste 陷阱
 async function executeInKokoTerminal(cmd, timeoutMs) {
   const isKokoFrame = location.pathname.includes("/koko/") || document.querySelector(".xterm");
@@ -336,22 +336,20 @@ async function executeInKokoTerminal(cmd, timeoutMs) {
   const term = findXtermInstance(xtermEl);
   if (!term) return { matched: false };
 
-  // 动态 Marker 防回显碰撞
-  const token = Math.random().toString(36).slice(2, 8);
-  const startMarker = `__BCTL_S_${token}__`;
-  const endPrefix = `__BCTL_E_${token}_`;
-  const wrappedCmd = `printf "\\n__BCTL_S_%s__\\n" "${token}"; ${cmd}; printf "\\n__BCTL_E_%s_%d__\\n" "${token}" $?\r`;
+  const cleanCmd = cmd.replace(/[\r\n]+$/, "");
+  const cmdLines = cleanCmd.split(/\r?\n/);
+  const rawInput = `${cleanCmd}\r`;
 
-  function extractBufferLines(buffer, startLineIdx) {
-    const totalLines = buffer.length;
+  function extractLogicalLines(buffer, fromRow, toRow) {
+    const maxIdx = Math.min(buffer.length - 1, toRow);
     const logicalLines = [];
     let currentLine = "";
 
-    for (let i = Math.max(0, startLineIdx); i < totalLines; i++) {
+    for (let i = Math.max(0, fromRow); i <= maxIdx; i++) {
       const line = buffer.getLine(i);
       if (!line) continue;
-      const nextLine = i + 1 < totalLines ? buffer.getLine(i + 1) : null;
-      const isNextWrapped = nextLine && nextLine.isWrapped;
+      const nextLine = i + 1 <= maxIdx ? buffer.getLine(i + 1) : null;
+      const isNextWrapped = Boolean(nextLine && nextLine.isWrapped);
 
       // 软折行还原
       currentLine += line.translateToString(!isNextWrapped);
@@ -364,13 +362,95 @@ async function executeInKokoTerminal(cmd, timeoutMs) {
     return logicalLines;
   }
 
-  const startBaseLine = Math.max(0, term.buffer.active.baseY + term.buffer.active.cursorY - 2);
+  function isInteractivePrompt(trimmed) {
+    if (!trimmed) return false;
+    if (/(?:password|passphrase)(?:\s+for\s+[^\s:]+)?\s*:\s*$/i.test(trimmed)) return true;
+    if (/\((?:yes\/no(?:\/\[fingerprint\])?|y\/n)\)\??\s*:?\s*$/i.test(trimmed)) return true;
+    return false;
+  }
+
+  function isShellPrompt(trimmed, initPrompt) {
+    if (!trimmed) return false;
+    if (initPrompt && trimmed === initPrompt) return true;
+    // 常见 Linux/Unix Shell 提示符: [user@host dir]# / $ 或 user@host:dir# / $ 等
+    if (/^(?:\([^)]+\)\s*)*\[[^\]]+@[^\]]+\]\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/^(?:\([^)]+\)\s*)*[^\s@]+@[^\s:]+:[^\s]*\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/^(?:sh|bash|zsh|csh|ksh|dash|ash)(?:-[\d.]+)?\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/^(?:mysql|redis[^›>]*|postgres[^›>]*|sqlite3?)\s*>\s*$/i.test(trimmed)) return true;
+    if (isInteractivePrompt(trimmed)) return true;
+    return false;
+  }
+
+  const activeBuf = term.buffer.active;
+  let startRow = activeBuf.baseY + activeBuf.cursorY;
+  while (startRow > 0 && activeBuf.getLine(startRow)?.isWrapped) {
+    startRow--;
+  }
+
+  const initialPromptLines = extractLogicalLines(activeBuf, Math.max(0, startRow - 2), activeBuf.baseY + activeBuf.cursorY);
+  const tailText = initialPromptLines.join("\n");
+  if (/Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tailText)) {
+    return {
+      matched: true,
+      ok: false,
+      error: "当前 JumpServer Web 终端连接已断开 (Connection websocket closed)，请重新连接资产后再执行命令",
+      partialOutput: tailText,
+    };
+  }
+  const initialPrompt = (extractLogicalLines(activeBuf, startRow, activeBuf.baseY + activeBuf.cursorY)[0] || "").trim();
 
   return new Promise((resolve) => {
-    let disposable = null;
-    const timer = setTimeout(() => {
-      if (disposable) disposable.dispose();
-      const partial = extractBufferLines(term.buffer.active, startBaseLine).join("\n");
+    let writeDisposable = null;
+    let trimDisposable = null;
+    let settleTimer = null;
+    let pollTimer = null;
+    let finished = false;
+
+    const cleanup = () => {
+      finished = true;
+      clearTimeout(timeoutTimer);
+      if (settleTimer) clearTimeout(settleTimer);
+      if (pollTimer) clearInterval(pollTimer);
+      if (writeDisposable && typeof writeDisposable.dispose === "function") writeDisposable.dispose();
+      if (trimDisposable && typeof trimDisposable.dispose === "function") trimDisposable.dispose();
+    };
+
+    // 追踪环形缓冲区满载时的顶部裁剪行数，保持 startRow 精确对齐
+    const rawLineList =
+      term._core?._bufferService?.buffer?.lines ||
+      term._core?.buffer?.lines ||
+      term.buffer?.active?._buffer?.lines;
+    if (rawLineList && typeof rawLineList.onTrim === "function") {
+      trimDisposable = rawLineList.onTrim((amount) => {
+        startRow = Math.max(0, startRow - amount);
+      });
+    }
+
+    const sliceCleanOutput = (lines) => {
+      if (lines.length === 0) return "";
+      let outStart = 1;
+      for (let k = 1; k < cmdLines.length && outStart < lines.length - 1; k++) {
+        const rawEcho = lines[outStart];
+        const strippedEcho = rawEcho.replace(/^>\s?/, "").trim();
+        const expected = cmdLines[k].trim();
+        if (strippedEcho === expected || rawEcho.trim() === expected) {
+          outStart++;
+        } else {
+          break;
+        }
+      }
+      const lastTrimmed = lines[lines.length - 1].trim();
+      const outEnd = isInteractivePrompt(lastTrimmed) ? lines.length : Math.max(outStart, lines.length - 1);
+      return lines.slice(outStart, outEnd).join("\n").trim();
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      if (finished) return;
+      const buf = term.buffer.active;
+      const curY = buf.baseY + buf.cursorY;
+      const lines = extractLogicalLines(buf, Math.max(0, startRow - 5), curY);
+      const partial = lines.join("\n");
+      cleanup();
       resolve({
         matched: true,
         ok: false,
@@ -379,39 +459,59 @@ async function executeInKokoTerminal(cmd, timeoutMs) {
       });
     }, timeoutMs);
 
+    const finalizeIfReady = () => {
+      if (finished) return;
+      const buf = term.buffer.active;
+      const curY = buf.baseY + buf.cursorY;
+      const lines = extractLogicalLines(buf, startRow, curY);
+      if (lines.length < cmdLines.length + 1) return;
+
+      const lastTrimmed = lines[lines.length - 1].trim();
+      if (!isShellPrompt(lastTrimmed, initialPrompt)) return;
+
+      const output = sliceCleanOutput(lines);
+      cleanup();
+      resolve({
+        matched: true,
+        ok: true,
+        exitCode: 0,
+        output,
+      });
+    };
+
     const checkBuffer = () => {
-      const lines = extractBufferLines(term.buffer.active, startBaseLine);
-      const startIdx = lines.findIndex((l) => l.trim() === startMarker);
-      if (startIdx === -1) return;
+      if (finished) return;
+      if (settleTimer) {
+        clearTimeout(settleTimer);
+        settleTimer = null;
+      }
 
-      for (let i = startIdx + 1; i < lines.length; i++) {
-        const trimmed = lines[i].trim();
-        if (trimmed.startsWith(endPrefix) && trimmed.endsWith("__")) {
-          clearTimeout(timer);
-          if (disposable) disposable.dispose();
+      const buf = term.buffer.active;
+      const curY = buf.baseY + buf.cursorY;
+      if (startRow > curY) startRow = curY;
 
-          const exitCodeStr = trimmed.slice(endPrefix.length, -2);
-          const output = lines.slice(startIdx + 1, i).join("\n");
-          resolve({
-            matched: true,
-            ok: true,
-            exitCode: Number(exitCodeStr),
-            output: output.trim(),
-          });
-          return;
-        }
+      const lines = extractLogicalLines(buf, startRow, curY);
+      if (lines.length < cmdLines.length + 1) return;
+
+      const lastTrimmed = lines[lines.length - 1].trim();
+      if (isShellPrompt(lastTrimmed, initialPrompt)) {
+        // 提示符出现后等待 120ms 静默稳定期，确保多段输出或长回显完全落盘
+        settleTimer = setTimeout(finalizeIfReady, 120);
       }
     };
 
     if (typeof term.onWriteParsed === "function") {
-      disposable = term.onWriteParsed(checkBuffer);
+      writeDisposable = term.onWriteParsed(checkBuffer);
     }
+    pollTimer = setInterval(() => {
+      if (!settleTimer) checkBuffer();
+    }, 150);
 
-    // 优先使用底层 triggerDataEvent 绕过 Bracketed Paste 陷阱
+    // 优先使用底层 triggerDataEvent 绕过 Bracketed Paste 陷阱，直接下发纯净明文命令
     if (term._core?.coreService?.triggerDataEvent) {
-      term._core.coreService.triggerDataEvent(wrappedCmd, true);
+      term._core.coreService.triggerDataEvent(rawInput, true);
     } else {
-      term.paste(wrappedCmd);
+      term.paste(rawInput);
     }
   });
 }
