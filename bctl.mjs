@@ -164,6 +164,7 @@ bctl - 极简日常 Chrome 控制工具 (支持 JumpServer 终端直连与后台
 命令列表:
   bctl tabs                查看所有已打开的标签页（列出 TabID、标题、URL）
   bctl bind <ID或关键词>   将大模型控制目标锁定在指定标签页（后台并发，不夺取前台焦点）
+  bctl unbind / release    解除控制并释放绑定的标签页（立即平滑淡出胶囊并恢复原生 Tab 栏图标）
   bctl new <url>           在后台静默打开新标签页并自动绑定（人类前台零干扰）
   bctl open <url>          在当前绑定的标签页打开指定网址并返回元素列表
   bctl exec "<shell命令>"  在绑定的 JumpServer Web 终端中执行命令并获取输出
@@ -256,6 +257,9 @@ if (cmd === "daemon") {
     process.exit(1);
   }
   const result = await sendCommand("act", { actions: Array.isArray(parsed) ? parsed : [parsed] });
+  console.log(result);
+} else if (cmd === "unbind" || cmd === "release") {
+  const result = await sendCommand("unbind");
   console.log(result);
 } else if (cmd === "reload") {
   const result = await sendCommand("reload");

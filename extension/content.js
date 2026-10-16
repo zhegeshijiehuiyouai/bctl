@@ -19,39 +19,77 @@
   let cursorX = window.innerWidth / 2;
   let cursorY = window.innerHeight / 2;
   let isControlling = false;
+  let controlIdleTimer = null;
 
   // 1. ChatGPT 官方原版标签页图标光标（在 Chrome 原生 Tab 栏渲染鼠标箭头）
   const CHATGPT_CURSOR_PATH = "M3.04536 4.45259C2.7582 3.60299 3.60299 2.7582 4.45259 3.04536L14.1828 6.33403C15.1637 6.66558 15.0872 8.08006 14.0715 8.39045L10.2994 9.54319C9.93919 9.65327 9.65327 9.93919 9.54319 10.2994L8.39046 14.0715C8.08007 15.0872 6.66558 15.1637 6.33404 14.1828L3.04536 4.45259Z";
 
-function applyTabFaviconArrow() {
-  try {
-    const iconLinks = Array.from(document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"]'));
-    const originalHref = iconLinks[0]?.getAttribute("href") || "";
+  // 设置并记录原始 Favicon（借鉴 ChatGPT 官方 TAB_FAVICON_BADGE 机制）
+  function applyTabFaviconArrow() {
+    try {
+      const iconLinks = Array.from(document.querySelectorAll('link[rel~="icon"], link[rel="shortcut icon"]'));
+      let originalHref = "";
+      if (iconLinks.length > 0) {
+        // 若此前已记录过原生 href，优先使用已保存的原生 href
+        originalHref = iconLinks[0].dataset.bctlOriginalHref !== undefined
+          ? iconLinks[0].dataset.bctlOriginalHref
+          : (iconLinks[0].getAttribute("href") || "");
+      }
 
-    const svgIcon = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
-      ${originalHref ? `<image href="${originalHref}" width="24" height="24" opacity="0.35" x="0" y="8" />` : ''}
-      <path d="${CHATGPT_CURSOR_PATH}" fill="#22c55e" stroke="white" stroke-width="1.8" stroke-linejoin="round" transform="translate(1, 1) scale(1.9)" />
-    </svg>`;
+      const svgIcon = `
+      <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+        ${originalHref ? `<image href="${originalHref}" width="24" height="24" opacity="0.35" x="0" y="8" />` : ''}
+        <path d="${CHATGPT_CURSOR_PATH}" fill="#22c55e" stroke="white" stroke-width="1.8" stroke-linejoin="round" transform="translate(1, 1) scale(1.9)" />
+      </svg>`;
 
-    const badgedDataUrl = `data:image/svg+xml,${encodeURIComponent(svgIcon.trim())}`;
+      const badgedDataUrl = `data:image/svg+xml,${encodeURIComponent(svgIcon.trim())}`;
 
-    if (iconLinks.length > 0) {
-      iconLinks.forEach(l => {
-        l.href = badgedDataUrl;
-        l.type = "image/svg+xml";
-      });
-    } else {
-      const link = document.createElement("link");
-      link.rel = "icon";
-      link.type = "image/svg+xml";
-      link.href = badgedDataUrl;
-      document.head.appendChild(link);
+      if (iconLinks.length > 0) {
+        iconLinks.forEach(l => {
+          if (l.dataset.bctlOriginalHref === undefined) {
+            l.dataset.bctlOriginalHref = l.getAttribute("href") || "";
+          }
+          l.dataset.bctlFavicon = "true";
+          l.href = badgedDataUrl;
+          l.type = "image/svg+xml";
+        });
+      } else {
+        const link = document.createElement("link");
+        link.rel = "icon";
+        link.type = "image/svg+xml";
+        link.href = badgedDataUrl;
+        link.dataset.bctlFavicon = "true";
+        link.dataset.bctlCreated = "true";
+        (document.head || document.documentElement).appendChild(link);
+      }
+    } catch (e) {
+      console.error("[bctl] 设置标签栏光标图标失败:", e);
     }
-  } catch (e) {
-    console.error("[bctl] 设置标签栏光标图标失败:", e);
   }
-}
+
+  // 还原原生 Favicon（借鉴 ChatGPT 官方 Rt() / Pe() 机制）
+  function restoreTabFavicon() {
+    try {
+      const badgedLinks = Array.from(document.querySelectorAll('link[data-bctl-favicon="true"]'));
+      badgedLinks.forEach(l => {
+        if (l.dataset.bctlCreated === "true") {
+          l.remove();
+        } else {
+          const orig = l.dataset.bctlOriginalHref;
+          if (orig) {
+            l.href = orig;
+          } else {
+            l.removeAttribute("href");
+          }
+          delete l.dataset.bctlOriginalHref;
+          delete l.dataset.bctlFavicon;
+          delete l.dataset.bctlCreated;
+        }
+      });
+    } catch (e) {
+      console.error("[bctl] 还原标签栏图标失败:", e);
+    }
+  }
 
 // 2. 初始化页面内 Overlay 与光标
 function ensureOverlay() {
@@ -129,7 +167,19 @@ function ensureOverlay() {
   }
 }
 
-// 激活控制状态：同时在页面内和原生 Tab 栏亮起光标指示
+// 隐藏控制状态：平滑淡出胶囊与光标，精准恢复原生 Tab 图标（借鉴 ChatGPT 官方规范）
+function hideControlState() {
+  if (controlIdleTimer) {
+    clearTimeout(controlIdleTimer);
+    controlIdleTimer = null;
+  }
+  isControlling = false;
+  if (indicatorPill) indicatorPill.style.opacity = "0";
+  if (cursorWrapper) cursorWrapper.style.opacity = "0";
+  restoreTabFavicon();
+}
+
+// 激活控制状态：同时在页面内和原生 Tab 栏亮起光标指示，并启动闲置自动恢复定时器
 function showControlState() {
   ensureOverlay();
   applyTabFaviconArrow();
@@ -141,7 +191,22 @@ function showControlState() {
   cursorX = window.innerWidth / 2;
   cursorY = window.innerHeight / 2;
   cursorWrapper.style.transform = `translate3d(${cursorX}px, ${cursorY}px, 0)`;
+
+  // 关键机制：大模型退出或停止使用后，闲置 6 秒自动退回正常状态并复原 Tab
+  if (controlIdleTimer) {
+    clearTimeout(controlIdleTimer);
+  }
+  controlIdleTimer = setTimeout(() => {
+    hideControlState();
+  }, 6000);
 }
+
+// 借鉴 ChatGPT 人类接管监听：如果人类主动在页面上发生交互（isTrusted 原生鼠标按下），立即解除控制态
+window.addEventListener("mousedown", (e) => {
+  if (e.isTrusted && isControlling) {
+    hideControlState();
+  }
+}, { capture: true, passive: true });
 
 // 3. 弹簧物理学模型 (Spring Physics)
 // 3. 弹簧物理学模型 (Spring Physics)
@@ -410,6 +475,13 @@ function scanElements() {
     return false;
   }
 
+  // 主动解除或隐藏控制态
+  if (req.action === "hide_control_state" || req.action === "release") {
+    hideControlState();
+    sendResponse({ ok: true });
+    return false;
+  }
+
   (async () => {
     try {
       if (req.action === "show_control_state") {
@@ -513,6 +585,9 @@ function scanElements() {
         }
 
         await new Promise(r => setTimeout(r, 300));
+        // 动作执行完毕，重置闲置 6 秒计时器
+        if (controlIdleTimer) clearTimeout(controlIdleTimer);
+        controlIdleTimer = setTimeout(() => hideControlState(), 6000);
         sendResponse(`执行结果: ${logs.join(" -> ")}\n\n${scanElements()}`);
       }
     } catch (err) {

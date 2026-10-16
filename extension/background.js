@@ -113,6 +113,18 @@ function connectWS() {
         return;
       }
 
+      // ─── 动作 2.6: 解除绑定与释放控制 (bctl unbind / bctl release) ───
+      if (action === "unbind" || action === "release") {
+        const { boundTabId } = await chrome.storage.session.get("boundTabId");
+        if (boundTabId) {
+          chrome.tabs.sendMessage(boundTabId, { action: "hide_control_state" }).catch(() => {});
+          await chrome.tabs.update(boundTabId, { autoDiscardable: true }).catch(() => {});
+          await chrome.storage.session.remove("boundTabId");
+        }
+        ws.send(JSON.stringify({ id, result: "已成功解除标签页绑定，指示胶囊与 Tab 栏图标已恢复正常" }));
+        return;
+      }
+
       // 获取当前控制目标 Tab（优先使用绑定的后台 Tab）
       const targetTab = await getTargetTab();
       if (!targetTab) {
@@ -369,5 +381,25 @@ async function executeInKokoTerminal(cmd, timeoutMs) {
     }
   });
 }
+
+// 借鉴 ChatGPT handleTabActivated 机制：人类主动切入标签页时，平滑恢复正常
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  try {
+    const { boundTabId } = await chrome.storage.session.get("boundTabId");
+    if (activeInfo.tabId === boundTabId) {
+      chrome.tabs.sendMessage(activeInfo.tabId, { action: "hide_control_state" }).catch(() => {});
+    }
+  } catch (_) {}
+});
+
+// 标签页关闭时清理 session 中的绑定 ID
+chrome.tabs.onRemoved.addListener(async (closedTabId) => {
+  try {
+    const { boundTabId } = await chrome.storage.session.get("boundTabId");
+    if (closedTabId === boundTabId) {
+      await chrome.storage.session.remove("boundTabId");
+    }
+  } catch (_) {}
+});
 
 connectWS();
