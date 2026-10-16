@@ -102,6 +102,32 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
   const createChatGptCursor = rn;
 
   // ─── 3. 初始化页面内 Overlay 与光标 ───
+  let statusResetTimer = null;
+
+  // 动态更新顶部悬浮胶囊中大模型的实时动作与操作状态
+  function setAgentStatus(text, autoResetDelay = 0) {
+    ensureOverlay();
+    showControlState();
+    if (statusResetTimer) {
+      clearTimeout(statusResetTimer);
+      statusResetTimer = null;
+    }
+    const statusEl = document.getElementById("bctl-status-text");
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.title = text;
+    }
+    if (autoResetDelay > 0) {
+      statusResetTimer = setTimeout(() => {
+        if (statusEl && isControlling) {
+          statusEl.textContent = "AI Agent 正在控制此标签页";
+          statusEl.removeAttribute("title");
+        }
+      }, autoResetDelay);
+    }
+  }
+
+  // ─── 3. 初始化页面内 Overlay 与光标 ───
   function ensureOverlay() {
     if (overlayRoot && document.documentElement.contains(overlayRoot)) return;
 
@@ -112,22 +138,22 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       pointer-events: none; overflow: hidden;
     `;
 
-    // 顶部居中 AI 控制状态胶囊指示器
+    // 顶部居中 AI 控制状态胶囊指示器（支持实时打印大模型动作）
     indicatorPill = document.createElement("div");
     indicatorPill.id = "bctl-indicator-pill";
     indicatorPill.innerHTML = `
-      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:7px;box-shadow:0 0 8px #22c55e;animation:bctlPulse 1.8s infinite;"></span>
-      <span>AI Agent 正在控制此标签页</span>
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:8px;box-shadow:0 0 8px #22c55e;animation:bctlPulse 1.8s infinite;flex-shrink:0;"></span>
+      <span id="bctl-status-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:380px;display:inline-block;vertical-align:middle;">AI Agent 正在控制此标签页</span>
     `;
     indicatorPill.style.cssText = `
       position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
-      background: rgba(15, 23, 42, 0.88); backdrop-filter: blur(12px);
-      border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 9999px;
+      background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 9999px;
       color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      font-size: 12px; font-weight: 500; padding: 6px 14px;
+      font-size: 12px; font-weight: 500; padding: 6px 16px;
       display: flex; align-items: center; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
       opacity: 0; transition: opacity 0.35s ease, transform 0.35s cubic-bezier(0.16, 1, 0.3, 1);
-      z-index: 2147483647;
+      z-index: 2147483647; pointer-events: none;
     `;
 
     overlayRoot.appendChild(indicatorPill);
@@ -159,12 +185,6 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
           0% { transform: scale(0.3); opacity: 1; }
           100% { transform: scale(2.6); opacity: 0; }
         }
-        .bctl-badge-overlay {
-          position: fixed; z-index: 2147483645;
-          background: #2563eb; color: #fff; font-size: 11px; font-weight: bold;
-          padding: 1px 5px; border-radius: 4px; pointer-events: none;
-          box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-family: monospace;
-        }
       `;
       document.head.appendChild(style);
     }
@@ -176,8 +196,19 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       clearTimeout(controlTimeoutTimer);
       controlTimeoutTimer = null;
     }
+    if (statusResetTimer) {
+      clearTimeout(statusResetTimer);
+      statusResetTimer = null;
+    }
     isControlling = false;
-    if (indicatorPill) indicatorPill.style.opacity = "0";
+    if (indicatorPill) {
+      indicatorPill.style.opacity = "0";
+      const statusEl = document.getElementById("bctl-status-text");
+      if (statusEl) {
+        statusEl.textContent = "AI Agent 正在控制此标签页";
+        statusEl.removeAttribute("title");
+      }
+    }
     if (cursorInstance) {
       cursorInstance.setState({
         cursor: { x: cursorX, y: cursorY, visible: false, animateMovement: false },
@@ -201,13 +232,14 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       hideControlState();
     }, CONTROL_TIMEOUT_MS);
 
+    if (indicatorPill) indicatorPill.style.opacity = "1";
+
     // 关键优化：如果当前已处于控制态，保持现有光标位置不变，严禁重置至屏幕正中央！
     if (isControlling) {
       return;
     }
 
     isControlling = true;
-    if (indicatorPill) indicatorPill.style.opacity = "1";
 
     if (cursorInstance) {
       cursorInstance.setState({
@@ -460,7 +492,19 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       : "";
   }
 
-  // 扫描页面并渲染数字角标
+  function getElementDesc(el) {
+    if (!el) return "";
+    const raw = el.innerText || el.placeholder || el.value || el.getAttribute("aria-label") || el.title || el.getAttribute("name") || "";
+    const clean = raw.replace(/\s+/g, " ").trim();
+    if (clean) {
+      return clean.length > 16 ? clean.slice(0, 16) + "..." : clean;
+    }
+    const tag = el.tagName ? el.tagName.toLowerCase() : "元素";
+    const type = el.getAttribute && el.getAttribute("type") ? `:${el.getAttribute("type")}` : "";
+    return `<${tag}${type}>`;
+  }
+
+  // 扫描页面并感知可交互元素（静默感知，不再在页面上渲染打扰视觉的数字角标）
   function scanElements() {
     document.querySelectorAll(".bctl-badge-overlay").forEach(b => b.remove());
     const selector = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [onclick]';
@@ -474,15 +518,6 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
     const lines = [`当前页面: ${document.title} (${location.href})`];
 
     elements.slice(0, 100).forEach((el, i) => {
-      const rect = el.getBoundingClientRect();
-      const badge = document.createElement("div");
-      badge.className = "bctl-badge-overlay";
-      badge.textContent = i;
-      badge.style.left = `${Math.max(0, rect.left - 4)}px`;
-      badge.style.top = `${Math.max(0, rect.top - 8)}px`;
-      document.documentElement.appendChild(badge);
-      setTimeout(() => badge.remove(), 2600);
-
       const tag = el.tagName.toLowerCase();
       const type = el.getAttribute("type") ? `:${el.getAttribute("type")}` : "";
       const label = (el.innerText || el.placeholder || el.value || el.getAttribute("aria-label") || el.title || "")
@@ -517,10 +552,19 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       try {
         if (req.action === "show_control_state") {
           showControlState();
+          if (req.payload?.text) {
+            setAgentStatus(req.payload.text, req.payload.autoResetDelay || 0);
+          }
+          sendResponse({ ok: true });
+        } else if (req.action === "set_status") {
+          setAgentStatus(req.payload?.text || "AI Agent 正在控制此标签页", req.payload?.autoResetDelay || 0);
           sendResponse({ ok: true });
         } else if (req.action === "look") {
-          showControlState();
-          sendResponse(scanElements());
+          setAgentStatus("正在感知页面元素...");
+          const res = scanElements();
+          const count = window._bctlElements ? window._bctlElements.length : 0;
+          setAgentStatus(`已感知 ${count} 个页面元素`, 2500);
+          sendResponse(res);
         } else if (req.action === "act") {
           showControlState();
           const actions = req.payload.actions || [];
@@ -528,20 +572,27 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
           for (const act of actions) {
             const { type, id, text, key, direction, x, y } = act;
+            const targetEl = (id !== undefined && window._bctlElements) ? window._bctlElements[id] : null;
+            const elDesc = getElementDesc(targetEl);
+
+            if (act.desc || act.status) {
+              setAgentStatus(act.desc || act.status);
+            }
 
             if (type === "click") {
               let targetX, targetY;
               if (typeof x === "number" && typeof y === "number") {
                 targetX = x;
                 targetY = y;
+                if (!act.desc && !act.status) setAgentStatus(`正在点击 (${targetX}, ${targetY})`);
                 await springMoveTo(targetX, targetY);
               } else {
-                const el = window._bctlElements?.[id];
-                if (!el) { logs.push(`未找到元素 [${id}]`); continue; }
-                const pos = await moveToElement(el);
+                if (!targetEl) { logs.push(`未找到元素 [${id}]`); continue; }
+                if (!act.desc && !act.status) setAgentStatus(elDesc ? `正在点击 "${elDesc}"` : `正在点击元素 [${id}]`);
+                const pos = await moveToElement(targetEl);
                 targetX = pos.targetX;
                 targetY = pos.targetY;
-                el.focus();
+                targetEl.focus();
               }
               playRipple(targetX, targetY);
               const clickTarget = document.elementFromPoint(targetX, targetY) || (id !== undefined ? window._bctlElements?.[id] : null);
@@ -556,24 +607,27 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
               if (typeof x === "number" && typeof y === "number") {
                 targetX = x;
                 targetY = y;
+                if (!act.desc && !act.status) setAgentStatus(`正在移向 (${targetX}, ${targetY})`);
                 await springMoveTo(targetX, targetY);
               } else {
-                const el = window._bctlElements?.[id];
-                if (!el) { logs.push(`未找到元素 [${id}]`); continue; }
-                const pos = await moveToElement(el);
+                if (!targetEl) { logs.push(`未找到元素 [${id}]`); continue; }
+                if (!act.desc && !act.status) setAgentStatus(elDesc ? `正在移向 "${elDesc}"` : `正在移向元素 [${id}]`);
+                const pos = await moveToElement(targetEl);
                 targetX = pos.targetX;
                 targetY = pos.targetY;
               }
               logs.push(`光标移至 ${id !== undefined ? `[${id}]` : `(${targetX}, ${targetY})`}`);
             } else if (type === "type") {
-              const el = window._bctlElements?.[id];
-              if (!el) { logs.push(`未找到输入框 [${id}]`); continue; }
-              const { targetX, targetY } = await moveToElement(el);
+              if (!targetEl) { logs.push(`未找到输入框 [${id}]`); continue; }
+              const displayTxt = (text || "").length > 14 ? (text || "").slice(0, 14) + "..." : (text || "");
+              if (!act.desc && !act.status) setAgentStatus(elDesc ? `正在向 "${elDesc}" 输入: ${displayTxt}` : `正在输入: ${displayTxt}`);
+              const { targetX, targetY } = await moveToElement(targetEl);
               playRipple(targetX, targetY);
-              await humanType(el, text || "");
+              await humanType(targetEl, text || "");
               logs.push(`在 [${id}] 输入 "${text}"`);
             } else if (type === "press") {
               const k = key || "Enter";
+              if (!act.desc && !act.status) setAgentStatus(`正在按键: ${k}`);
               const active = document.activeElement || document.body;
               active.dispatchEvent(new KeyboardEvent("keydown", { key: k, code: k, bubbles: true }));
               active.dispatchEvent(new KeyboardEvent("keyup", { key: k, code: k, bubbles: true }));
@@ -592,6 +646,7 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
               const px = typeof act.x === "number" ? act.x : Math.round(window.innerWidth / 2);
               const py = typeof act.y === "number" ? act.y : Math.round(window.innerHeight / 2);
               const dirLabel = dy >= 0 ? "向下" : "向上";
+              if (!act.desc && !act.status) setAgentStatus(`正在${dirLabel}滚动页面...`);
 
               const target = findScrollTarget(px, py, dy);
               const beforeTop = target.scrollTop;
@@ -636,11 +691,13 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
                 );
               }
             } else if (type === "wait") {
+              if (!act.desc && !act.status) setAgentStatus("正在等待页面响应...");
               await new Promise(r => setTimeout(r, 1000));
             }
             await new Promise(r => setTimeout(r, 250));
           }
 
+          setAgentStatus("操作执行完成", 2500);
           await new Promise(r => setTimeout(r, 300));
           if (controlTimeoutTimer) clearTimeout(controlTimeoutTimer);
           controlTimeoutTimer = setTimeout(() => hideControlState(), CONTROL_TIMEOUT_MS);

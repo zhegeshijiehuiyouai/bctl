@@ -168,8 +168,9 @@ bctl - 极简日常 Chrome 控制工具 (支持 JumpServer 终端直连与后台
   bctl new <url>           在后台静默打开新标签页并自动绑定（人类前台零干扰）
   bctl open <url>          在当前绑定的标签页打开指定网址并返回元素列表
   bctl exec "<shell命令>"  在绑定的 JumpServer Web 终端中执行命令并获取输出
-  bctl look                扫描当前页面所有可交互元素，打上编号角标并返回索引列表
+  bctl look                静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要（不再在页面渲染数字角标）
   bctl act '<JSON动作数组>' 驱动 ChatGPT 同款弹簧物理鼠标执行动作（支持 click, type, press, scroll, wait）
+  bctl state "<描述>"      在受控页面顶部悬浮胶囊打印当前操作描述（如 "正在排查报警..."）
   bctl reload              热重载 Chrome 扩展（开发调试时刷新 content.js 与 background.js）
   bctl status              查看 Chrome 扩展与守护进程连接状态
 
@@ -257,6 +258,14 @@ if (cmd === "daemon") {
     process.exit(1);
   }
   const result = await sendCommand("act", { actions: Array.isArray(parsed) ? parsed : [parsed] });
+  console.log(result);
+} else if (cmd === "state" || cmd === "status-pill") {
+  const text = args.slice(1).join(" ");
+  if (!text) {
+    console.error("用法: bctl state \"<要显示在受控页面悬浮胶囊中的状态描述>\"");
+    process.exit(1);
+  }
+  const result = await sendCommand("state", { text });
   console.log(result);
 } else if (cmd === "unbind" || cmd === "release") {
   const result = await sendCommand("unbind");

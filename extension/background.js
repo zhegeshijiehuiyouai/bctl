@@ -119,7 +119,10 @@ async function connectWS() {
         await chrome.tabs.update(matchedTab.id, { autoDiscardable: false }).catch(() => {});
         // 激活 ChatGPT 同款中央光标与控制胶囊 + Tab 图标光标
         await ensureContentScript(matchedTab.id);
-        chrome.tabs.sendMessage(matchedTab.id, { action: "show_control_state" }).catch(() => {});
+        chrome.tabs.sendMessage(matchedTab.id, {
+          action: "set_status",
+          payload: { text: "AI Agent 已接管此标签页", autoResetDelay: 2500 }
+        }).catch(() => {});
 
         ws.send(JSON.stringify({
           id,
@@ -136,7 +139,10 @@ async function connectWS() {
 
         await waitForTabLoad(newTab.id);
         await ensureContentScript(newTab.id);
-        chrome.tabs.sendMessage(newTab.id, { action: "show_control_state" }).catch(() => {});
+        chrome.tabs.sendMessage(newTab.id, {
+          action: "set_status",
+          payload: { text: "正在加载并感知新页面..." }
+        }).catch(() => {});
         const res = await chrome.tabs.sendMessage(newTab.id, { action: "look" });
         ws.send(JSON.stringify({ id, result: `[已在后台打开新标签页 ${newTab.id}: ${payload.url}]\n\n${res}` }));
         return;
@@ -168,6 +174,12 @@ async function connectWS() {
       if (action === "term_exec") {
         const cmd = payload.cmd || "";
         const timeoutMs = payload.timeoutMs || 15000;
+        await ensureContentScript(targetTab.id);
+        const cmdSummary = cmd.length > 28 ? cmd.slice(0, 28) + "..." : cmd;
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: `正在执行命令: ${cmdSummary}` }
+        }).catch(() => {});
 
         const results = await chrome.scripting.executeScript({
           target: { tabId: targetTab.id, allFrames: true },
@@ -178,12 +190,21 @@ async function connectWS() {
 
         const hit = results?.find(r => r?.result && r.result.matched === true);
         if (!hit) {
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: "未找到激活终端", autoResetDelay: 2500 }
+          }).catch(() => {});
           ws.send(JSON.stringify({
             id,
             result: `在标签页 [${targetTab.id}] "${targetTab.title}" 中未找到处于可见/激活状态的 JumpServer (Koko) xterm 终端！`
           }));
           return;
         }
+
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: "终端命令执行完成", autoResetDelay: 2500 }
+        }).catch(() => {});
 
         if (hit.result.ok) {
           ws.send(JSON.stringify({ id, result: hit.result.output }));
@@ -198,11 +219,27 @@ async function connectWS() {
 
       // ─── 动作 4: 打开新网址 (bctl open) ───
       if (action === "open") {
+        await ensureContentScript(targetTab.id);
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: `正在打开网址: ${payload.url}...` }
+        }).catch(() => {});
         await chrome.tabs.update(targetTab.id, { url: payload.url });
         await waitForTabLoad(targetTab.id);
         await ensureContentScript(targetTab.id);
         const res = await chrome.tabs.sendMessage(targetTab.id, { action: "look" });
         ws.send(JSON.stringify({ id, result: res }));
+        return;
+      }
+
+      // ─── 动作 4.5: 设置状态描述 (bctl state <描述>) ───
+      if (action === "state" || action === "set_status") {
+        await ensureContentScript(targetTab.id);
+        await chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: payload.text, autoResetDelay: payload.autoResetDelay || 0 }
+        });
+        ws.send(JSON.stringify({ id, result: `已更新受控页面状态提示: "${payload.text}"` }));
         return;
       }
 
