@@ -19,7 +19,6 @@
   let cursorX = window.innerWidth / 2;
   let cursorY = window.innerHeight / 2;
   let isControlling = false;
-  let controlIdleTimer = null;
 
   // 1. ChatGPT 官方原版标签页图标光标（在 Chrome 原生 Tab 栏渲染鼠标箭头）
   const CHATGPT_CURSOR_PATH = "M3.04536 4.45259C2.7582 3.60299 3.60299 2.7582 4.45259 3.04536L14.1828 6.33403C15.1637 6.66558 15.0872 8.08006 14.0715 8.39045L10.2994 9.54319C9.93919 9.65327 9.65327 9.93919 9.54319 10.2994L8.39046 14.0715C8.08007 15.0872 6.66558 15.1637 6.33404 14.1828L3.04536 4.45259Z";
@@ -167,19 +166,15 @@ function ensureOverlay() {
   }
 }
 
-// 隐藏控制状态：平滑淡出胶囊与光标，精准恢复原生 Tab 图标（借鉴 ChatGPT 官方规范）
+// 隐藏控制状态：平滑淡出胶囊与光标，精准恢复原生 Tab 图标（严格对齐 ChatGPT 官方规范）
 function hideControlState() {
-  if (controlIdleTimer) {
-    clearTimeout(controlIdleTimer);
-    controlIdleTimer = null;
-  }
   isControlling = false;
   if (indicatorPill) indicatorPill.style.opacity = "0";
   if (cursorWrapper) cursorWrapper.style.opacity = "0";
   restoreTabFavicon();
 }
 
-// 激活控制状态：同时在页面内和原生 Tab 栏亮起光标指示，并启动闲置自动恢复定时器
+// 激活控制状态：同时在页面内和原生 Tab 栏亮起光标指示
 function showControlState() {
   ensureOverlay();
   applyTabFaviconArrow();
@@ -191,14 +186,6 @@ function showControlState() {
   cursorX = window.innerWidth / 2;
   cursorY = window.innerHeight / 2;
   cursorWrapper.style.transform = `translate3d(${cursorX}px, ${cursorY}px, 0)`;
-
-  // 关键机制：大模型退出或停止使用后，闲置 6 秒自动退回正常状态并复原 Tab
-  if (controlIdleTimer) {
-    clearTimeout(controlIdleTimer);
-  }
-  controlIdleTimer = setTimeout(() => {
-    hideControlState();
-  }, 6000);
 }
 
 // 借鉴 ChatGPT 人类接管监听：如果人类主动在页面上发生交互（isTrusted 原生鼠标按下），立即解除控制态
@@ -585,9 +572,6 @@ function scanElements() {
         }
 
         await new Promise(r => setTimeout(r, 300));
-        // 动作执行完毕，重置闲置 6 秒计时器
-        if (controlIdleTimer) clearTimeout(controlIdleTimer);
-        controlIdleTimer = setTimeout(() => hideControlState(), 6000);
         sendResponse(`执行结果: ${logs.join(" -> ")}\n\n${scanElements()}`);
       }
     } catch (err) {

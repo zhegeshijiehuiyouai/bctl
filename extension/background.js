@@ -13,19 +13,35 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-function connectWS() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+let isConnecting = false;
+
+async function connectWS() {
+  if (isConnecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) {
     return;
   }
+  isConnecting = true;
 
   try {
+    // 关键优化：先做轻量 fetch 静默探活，避免在 daemon 重启或未就绪时触发底层 net::ERR_CONNECTION_REFUSED
+    const isDaemonUp = await fetch("http://127.0.0.1:9224/status", { signal: AbortSignal.timeout(600) })
+      .then(res => res.ok)
+      .catch(() => false);
+
+    if (!isDaemonUp) {
+      isConnecting = false;
+      setTimeout(connectWS, 2500);
+      return;
+    }
+
     ws = new WebSocket(WS_URL);
   } catch (e) {
-    setTimeout(connectWS, 2000);
+    isConnecting = false;
+    setTimeout(connectWS, 2500);
     return;
   }
 
   ws.onopen = () => {
+    isConnecting = false;
     console.log("[Extension] 成功连接至本地 bctl 守护进程");
   };
 
@@ -189,10 +205,12 @@ function connectWS() {
   };
 
   ws.onclose = () => {
+    isConnecting = false;
     ws = null;
     setTimeout(connectWS, 2500);
   };
   ws.onerror = () => {
+    isConnecting = false;
     if (ws) ws.close();
   };
 }
