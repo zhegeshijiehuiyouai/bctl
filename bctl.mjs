@@ -273,6 +273,14 @@ if (cmd === "daemon") {
 } else if (cmd === "reload") {
   const result = await sendCommand("reload");
   console.log(result);
+} else if (cmd === "eval") {
+  const code = args.slice(1).join(" ");
+  if (!code) {
+    console.error("用法: bctl eval \"<js代码>\"");
+    process.exit(1);
+  }
+  const result = await sendCommand("eval", { code });
+  console.log(result);
 } else {
   console.error(`未知命令: ${cmd}。运行 bctl help 查看帮助。`);
   process.exit(1);

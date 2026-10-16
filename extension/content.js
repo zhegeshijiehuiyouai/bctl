@@ -391,61 +391,237 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
   function canElementScroll(el, dy) {
     if (!el || el === document.body || el === document.documentElement) return false;
-    if (el.scrollHeight <= el.clientHeight + 2 || el.clientWidth < 50) return false;
+    if (el.scrollHeight <= el.clientHeight + 2 || el.clientWidth < 40) return false;
     if (dy > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2) return false;
     if (dy < 0 && el.scrollTop <= 1) return false;
-    const style = window.getComputedStyle(el);
+    const win = el.ownerDocument?.defaultView || window;
+    const style = win.getComputedStyle(el);
     return ["auto", "scroll", "overlay"].includes(style.overflowY);
   }
 
-  function getDeepElementsFromPoint(x, y) {
-    const elements = document.elementsFromPoint(x, y) || [];
+  function getDeepElementsFromPoint(x, y, doc = document) {
+    const elements = doc.elementsFromPoint(x, y) || [];
     const result = [];
     for (const el of elements) {
       result.push(el);
       if (el.shadowRoot && typeof el.shadowRoot.elementsFromPoint === "function") {
-        result.push(...el.shadowRoot.elementsFromPoint(x, y));
+        result.push(...getDeepElementsFromPoint(x, y, el.shadowRoot));
+      } else if (el.tagName === "IFRAME") {
+        try {
+          const iDoc = el.contentDocument;
+          if (iDoc) {
+            const rect = el.getBoundingClientRect();
+            const subX = x - rect.left;
+            const subY = y - rect.top;
+            if (subX >= 0 && subX <= rect.width && subY >= 0 && subY <= rect.height) {
+              result.push(...getDeepElementsFromPoint(subX, subY, iDoc));
+            }
+          }
+        } catch (e) {}
       }
     }
     return result;
   }
 
-  function findScrollTarget(px, py, dy) {
-    const hitElements = getDeepElementsFromPoint(px, py);
+  function collectScrollContainers() {
+    const list = [];
     const visited = new Set();
 
-    for (let current of hitElements) {
-      while (current && current !== document.body && current !== document.documentElement) {
-        if (visited.has(current)) break;
-        visited.add(current);
-        if (canElementScroll(current, dy)) {
-          return current;
+    function scanDoc(doc, frameInfo, depth) {
+      if (!doc) return;
+      const win = doc.defaultView || window;
+      const root = doc.scrollingElement || doc.documentElement;
+      if (!root) return;
+
+      const isRootScrollable = (root.scrollHeight > win.innerHeight + 2) || (root.scrollWidth > win.innerWidth + 2);
+      const isTopFrame = !frameInfo;
+      const defaultRole = isTopFrame ? "outer" : "modal";
+
+      list.push({
+        el: root,
+        doc: doc,
+        win: win,
+        frameInfo: frameInfo,
+        depth: depth,
+        role: defaultRole,
+        tag: root.tagName.toLowerCase(),
+        id: root.id || "",
+        className: typeof root.className === "string" ? root.className.trim() : "",
+        scrollHeight: root.scrollHeight,
+        clientHeight: win.innerHeight,
+        scrollTop: Math.round(root.scrollTop),
+        isRoot: true,
+        canScroll: isRootScrollable
+      });
+      visited.add(root);
+
+      const all = doc.querySelectorAll("div, main, section, article, ul, tbody, form, textarea, pre, .panel-body, .ant-table-body, .ant-modal-wrap, .ant-modal-body, .modal, .modal-body, .CodeMirror-scroll, .table-responsive");
+      for (const el of all) {
+        if (visited.has(el)) continue;
+        const style = win.getComputedStyle(el);
+        const hasOverflowY = ["auto", "scroll", "overlay"].includes(style.overflowY);
+        const canScrollY = hasOverflowY && el.scrollHeight > el.clientHeight + 2 && el.clientHeight >= 30;
+
+        if (canScrollY) {
+          visited.add(el);
+          const isModalLike = el.closest?.(".layui-layer, .modal, .ant-modal, .el-dialog, [role=dialog], .drawer, .ant-drawer") ||
+                              el.matches?.(".layui-layer, .modal, .ant-modal, .el-dialog, [role=dialog], .ant-modal-wrap, .ant-modal-body, .modal-body") ||
+                              frameInfo !== null;
+          const isTable = el.closest?.("table, .ant-table, .el-table, .table-responsive") || el.matches?.("tbody, .ant-table-body, .el-table__body-wrapper, .table-responsive");
+          const isEditor = el.closest?.(".CodeMirror, .monaco-editor") || el.matches?.(".CodeMirror-scroll, pre, textarea");
+
+          let role = "inner";
+          if (isEditor) role = "editor";
+          else if (isTable) role = "table";
+          else if (isModalLike) role = "modal";
+
+          const rect = el.getBoundingClientRect();
+          list.push({
+            el: el,
+            doc: doc,
+            win: win,
+            frameInfo: frameInfo,
+            depth: depth + (isModalLike ? 2 : 1),
+            role: role,
+            tag: el.tagName.toLowerCase(),
+            id: el.id || "",
+            className: typeof el.className === "string" ? el.className.trim() : "",
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+            scrollTop: Math.round(el.scrollTop),
+            rect: rect,
+            isRoot: false,
+            canScroll: true
+          });
         }
-        current = current.parentElement || (current.getRootNode && current.getRootNode().host);
+      }
+
+      const iframes = doc.querySelectorAll("iframe");
+      for (const iframe of iframes) {
+        try {
+          const iDoc = iframe.contentDocument;
+          if (iDoc) {
+            const iRect = iframe.getBoundingClientRect();
+            if (iRect.width > 20 && iRect.height > 20) {
+              scanDoc(iDoc, {
+                id: iframe.id || "",
+                className: typeof iframe.className === "string" ? iframe.className : ""
+              }, depth + 1);
+            }
+          }
+        } catch (e) {}
       }
     }
 
-    const rootScroller = document.scrollingElement || document.documentElement;
-    if (
-      rootScroller.scrollHeight > window.innerHeight + 2 &&
-      ((dy > 0 && rootScroller.scrollTop + window.innerHeight < rootScroller.scrollHeight - 2) ||
-       (dy < 0 && rootScroller.scrollTop > 1))
-    ) {
-      return rootScroller;
+    scanDoc(document, null, 0);
+    return list;
+  }
+
+  function findScrollTarget(act, dy) {
+    const containers = collectScrollContainers();
+    window._bctlScrollContainers = containers;
+
+    // 1. 显式指定目标：通过 target 别名或 S0, S1 索引
+    if (act.target !== undefined && act.target !== null && act.target !== "") {
+      const rawTarget = String(act.target).toLowerCase().trim();
+      const numMatch = rawTarget.match(/^s?(\d+)$/);
+      if (numMatch) {
+        const idx = parseInt(numMatch[1], 10);
+        const visibleScrollers = containers.filter(c => {
+          const max = Math.max(0, c.scrollHeight - c.clientHeight);
+          return max > 0;
+        });
+        if (visibleScrollers[idx]) return visibleScrollers[idx];
+        if (containers[idx]) return containers[idx];
+      }
+
+      if (["modal", "dialog", "popup", "layer"].includes(rawTarget)) {
+        const modalCandidates = containers.filter(c => c.role === "modal" && c.canScroll);
+        if (modalCandidates.length > 0) {
+          modalCandidates.sort((a, b) => b.depth - a.depth);
+          return modalCandidates[0];
+        }
+      }
+
+      if (["inner", "table", "editor"].includes(rawTarget)) {
+        const innerCandidates = containers.filter(c => ["inner", "table", "editor"].includes(c.role) && c.canScroll);
+        if (innerCandidates.length > 0) {
+          innerCandidates.sort((a, b) => b.depth - a.depth);
+          return innerCandidates[0];
+        }
+      }
+
+      if (["outer", "page", "root", "window"].includes(rawTarget)) {
+        const outer = containers.find(c => c.role === "outer");
+        if (outer) return outer;
+      }
     }
 
-    const candidates = [];
-    const allContainers = document.querySelectorAll("div, main, section, article, ul, tbody");
-    for (const el of allContainers) {
-      if (canElementScroll(el, dy)) {
-        const rect = el.getBoundingClientRect();
-        if (rect.bottom > 0 && rect.top < window.innerHeight && rect.width > 150) {
-          candidates.push({ el, area: rect.width * rect.height });
+    // 2. 显式 CSS 选择器查找
+    if (act.selector) {
+      try {
+        let el = document.querySelector(act.selector);
+        if (!el) {
+          for (const c of containers) {
+            if (c.doc && c.doc !== document) {
+              el = c.doc.querySelector(act.selector);
+              if (el) break;
+            }
+          }
+        }
+        if (el) {
+          const match = containers.find(c => c.el === el);
+          if (match) return match;
+          return { el, doc: el.ownerDocument, win: el.ownerDocument?.defaultView || window, role: "custom" };
+        }
+      } catch (e) {}
+    }
+
+    // 3. 关联元素 ID (从 look 中感知的数字编号)
+    if (act.id !== undefined && window._bctlElements && window._bctlElements[act.id]) {
+      let cur = window._bctlElements[act.id];
+      while (cur && cur !== document.documentElement && cur !== document.body) {
+        const match = containers.find(c => c.el === cur);
+        if (match) return match;
+        cur = cur.parentElement;
+      }
+    }
+
+    // 4. 坐标命中（支持深度穿透同源 iframe）
+    if (typeof act.x === "number" && typeof act.y === "number") {
+      const hitElements = getDeepElementsFromPoint(act.x, act.y);
+      for (const cur of hitElements) {
+        let p = cur;
+        while (p && p !== document.body && p !== document.documentElement) {
+          const match = containers.find(c => c.el === p);
+          if (match && match.canScroll) return match;
+          p = p.parentElement || (p.getRootNode && p.getRootNode().host);
         }
       }
     }
-    candidates.sort((a, b) => b.area - a.area);
-    return candidates.length > 0 ? candidates[0].el : rootScroller;
+
+    // 5. 智能防抢占首选：若页面上有处于打开状态的可见弹窗，优先滚动弹窗！
+    const activeModal = containers.filter(c => c.role === "modal" && c.canScroll);
+    if (activeModal.length > 0) {
+      activeModal.sort((a, b) => b.depth - a.depth);
+      return activeModal[0];
+    }
+
+    // 6. 屏幕中心点拾取
+    const cx = Math.round(window.innerWidth / 2);
+    const cy = Math.round(window.innerHeight / 2);
+    const centerHits = getDeepElementsFromPoint(cx, cy);
+    for (const cur of centerHits) {
+      let p = cur;
+      while (p && p !== document.body && p !== document.documentElement) {
+        const match = containers.find(c => c.el === p);
+        if (match && match.canScroll) return match;
+        p = p.parentElement || (p.getRootNode && p.getRootNode().host);
+      }
+    }
+
+    // 兜底外层根滚动条
+    return containers.find(c => c.role === "outer") || containers[0];
   }
 
   function extractVisibleDashboardData() {
@@ -529,6 +705,26 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
     const dataSummary = extractVisibleDashboardData();
     if (dataSummary) lines.push(dataSummary);
+
+    // 感知页面多级滚动容器（内外滚动条、弹窗、表格、代码块）
+    const containers = collectScrollContainers();
+    window._bctlScrollContainers = containers;
+    const scrollableOnes = containers.filter(c => {
+      const max = Math.max(0, c.scrollHeight - c.clientHeight);
+      return max > 0;
+    });
+    if (scrollableOnes.length > 0) {
+      lines.push("\n--- 可滚动容器 (Scroll Containers) ---");
+      scrollableOnes.forEach((sc, i) => {
+        const max = Math.max(0, sc.scrollHeight - sc.clientHeight);
+        const pct = max > 0 ? Math.min(100, Math.round((sc.scrollTop / max) * 100)) : 0;
+        const tag = sc.tag;
+        const cls = sc.className ? "." + sc.className.split(/\s+/)[0] : "";
+        const frameDesc = sc.frameInfo ? ` [frame: ${sc.frameInfo.id || "iframe"}]` : "";
+        const activeMark = (sc.role === "modal" && sc.canScroll) ? " [当前顶层激活]" : "";
+        lines.push(`[S${i}] <${tag}${cls}:${sc.role}>${frameDesc} (位置: ${sc.scrollTop}/${max}px, ${pct}%)${activeMark}`);
+      });
+    }
 
     return lines.join("\n");
   }
@@ -643,12 +839,11 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
                 dy = 500;
               }
 
-              const px = typeof act.x === "number" ? act.x : Math.round(window.innerWidth / 2);
-              const py = typeof act.y === "number" ? act.y : Math.round(window.innerHeight / 2);
               const dirLabel = dy >= 0 ? "向下" : "向上";
               if (!act.desc && !act.status) setAgentStatus(`正在${dirLabel}滚动页面...`);
 
-              const target = findScrollTarget(px, py, dy);
+              const targetInfo = findScrollTarget(act, dy);
+              const target = targetInfo.el;
               const beforeTop = target.scrollTop;
 
               // 1. 强制使用 instant 同步滚动，消除 smooth 动画导致的后续 look 读取竞态
@@ -657,9 +852,13 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
               // 2. 若原生 scrollTop 未发生改变（如纯虚拟列表 rc-virtual-list 或已触底），补发可取消的 WheelEvent
               if (Math.abs(actualMoved) < 1) {
-                const wheelTarget = document.elementFromPoint(px, py) || target;
+                const doc = targetInfo.doc || target.ownerDocument || document;
+                const win = targetInfo.win || doc.defaultView || window;
+                const px = typeof act.x === "number" ? act.x : Math.round(win.innerWidth / 2);
+                const py = typeof act.y === "number" ? act.y : Math.round(win.innerHeight / 2);
+                const wheelTarget = doc.elementFromPoint(px, py) || target;
                 wheelTarget.dispatchEvent(
-                  new WheelEvent("wheel", {
+                  new win.WheelEvent("wheel", {
                     deltaY: dy,
                     clientX: px,
                     clientY: py,
@@ -676,18 +875,20 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
               await new Promise(resolve => setTimeout(resolve, 120));
 
               // 4. 生成面向大模型防死循环的闭环状态回显
-              const maxScroll = Math.max(0, target.scrollHeight - target.clientHeight);
+              const maxScroll = Math.max(0, target.scrollHeight - (target.clientHeight || targetInfo.clientHeight || 0));
               const currentTop = Math.round(target.scrollTop);
+              const roleDesc = targetInfo.role ? `[${targetInfo.role}]` : "";
+              const frameDesc = targetInfo.frameInfo ? ` (frame: ${targetInfo.frameInfo.id || "iframe"})` : "";
               const tagDesc = `${target.tagName.toLowerCase()}${target.className && typeof target.className === "string" ? "." + target.className.trim().split(/\s+/)[0] : ""}`;
 
               if (Math.abs(actualMoved) >= 1) {
                 const progress = maxScroll > 0 ? Math.min(100, Math.round((currentTop / maxScroll) * 100)) : 100;
                 logs.push(
-                  `[Scroll 成功] 容器(${tagDesc}) ${dirLabel}实际滚动 ${Math.abs(actualMoved)}px | 当前位置: ${currentTop}/${maxScroll}px (${progress}%)`
+                  `[Scroll 成功] ${roleDesc} 容器(${tagDesc}${frameDesc}) ${dirLabel}实际滚动 ${Math.abs(actualMoved)}px | 当前位置: ${currentTop}/${maxScroll}px (${progress}%)`
                 );
               } else {
                 logs.push(
-                  `[Scroll 边界提示] 容器(${tagDesc})未发生物理位移(当前位置: ${currentTop}/${maxScroll}px)，已到达${dy >= 0 ? "底部" : "顶部"}或该区域为固定视图，请勿重复向同方向滚动，可直接读取当前页面数据。`
+                  `[Scroll 边界提示] ${roleDesc} 容器(${tagDesc}${frameDesc})未发生物理位移(当前位置: ${currentTop}/${maxScroll}px)，已到达${dy >= 0 ? "底部" : "顶部"}或该区域为固定视图。`
                 );
               }
             } else if (type === "wait") {

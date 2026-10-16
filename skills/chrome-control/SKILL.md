@@ -34,7 +34,7 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 - 点击元素或坐标：`{"type":"click","id":0}` 或 `{"type":"click","x":320,"y":240}`
 - 输入文本：`{"type":"type","id":1,"text":"关键词"}`
 - 按键提交：`{"type":"press","key":"Enter"}`
-- 容器/页面滚动：`{"type":"scroll","deltaY":500}`（正数向下，负数向上；可选 `"x"`, `"y"` 指定滚动区域坐标）
+- 容器/页面滚动：`{"type":"scroll","deltaY":500}`（正数向下，负数向上；可选 `"target":"modal"|"inner"|"outer"|0|1` 精准指定弹窗/内层/外层滚动条，或通过 `"id"` 关联元素、`"selector"` 指定选择器、`"x"`,`"y"` 指定坐标；弹窗激活时默认智能优先滚动弹窗）
 - 悬停 / 等待：`{"type":"move","id":0}`、`{"type":"wait"}`
 
 ## 页面操作原则

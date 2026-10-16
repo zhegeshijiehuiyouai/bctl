@@ -243,6 +243,26 @@ async function connectWS() {
         return;
       }
 
+      // ─── 动作 4.6: JS 表达式诊断评估 (bctl eval <js>) ───
+      if (action === "eval") {
+        await ensureContentScript(targetTab.id);
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          world: "MAIN",
+          args: [payload.code],
+          func: (code) => {
+            try {
+              const res = (0, eval)(code);
+              return typeof res === "object" ? JSON.stringify(res, null, 2) : String(res);
+            } catch (e) {
+              return "[Eval Error] " + e.message;
+            }
+          }
+        });
+        ws.send(JSON.stringify({ id, result: results?.[0]?.result }));
+        return;
+      }
+
       // ─── 动作 5: 常规 look / act（穿透至 content.js） ───
       await ensureContentScript(targetTab.id);
       const res = await chrome.tabs.sendMessage(targetTab.id, { action, payload });
