@@ -23,8 +23,11 @@
 - **👥 双人并发与后台多标签隔离 (True Background Concurrency)**：
   - 使用 `bctl new <url>` 在后台静默创建标签页并自动绑定，前台人类正在浏览的网页**绝不切页、绝不夺取焦点**。
   - 大模型在后台标签页自由执行点击、滚动、表单提交，人类在前台正常打字聊天，互不干扰。
-- **⚡ JumpServer 堡垒机 Web 终端直连穿透 (`bctl exec`)**：
-  - 直连 JumpServer (Luna/Koko) 的 xterm.js 实例，支持跨 iframe 递归探测、软折行（isWrapped）还原拼接、防后台休眠与纯净原样命令下发（无 `BCTL_S` / `BCTL_E` 标记污染），毫秒级返回干净的标准输出。
+- **⚡ 全类型 Web 终端直连穿透 (`bctl exec`)**：
+  - 直连 JumpServer (Luna/Koko)、DOPS / Rancher K8s 容器终端、自研 WebShell 等基于 xterm.js 的各类 Web 终端。支持跨 iframe 递归探测、Vue/React 深度实例穿透、DOM 极速拟真键入回退、软折行（isWrapped）还原拼接、防后台休眠与纯净原样命令下发，毫秒级返回干净的标准输出。
+- **🔍 智能页面环境嗅探与 DevTools 直连 (`bctl probe` / `bctl devtools`)**：
+  - 一键嗅探页面当前就绪的终端、Monaco / Ace / CodeMirror 代码编辑器与主表单；
+  - 穿透 Kibana DevTools 与自研 ES 控制台，自动注入查询语句并模拟触发原生快捷键提交，毫秒级抓取响应输出。
 - **🎯 ChatGPT 同款视觉与弹簧阻尼光标**：
   - 复刻 ChatGPT 原版 `cursor-chat` 鼠标图标与顶部 `[AI Agent 正在控制此标签页]` 状态胶囊，大模型当前动作（观察页面、点击目标、输入文字、滚动、终端命令）实时打印至顶部胶囊，不再在页面组件上贴数字角标，保持界面干净美观。
   - 动态在 Chrome 原生 Tab 栏 Favicon 上绘制绿色鼠标箭头，受控状态一目了然。
@@ -156,7 +159,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 | **查看标签页** | `bctl tabs` | 查看 Chrome 当前所有已打开的标签（包含 TabID、标题、URL、绑定状态） |
 | **后台打开网页** | `bctl new "https://github.com"` | **强烈推荐**：在后台静默创建标签页并自动绑定，前台人类视角 0 干扰 |
 | **锁定控制目标** | `bctl bind jumpserver` 或 `bctl bind 947878209` | 将后续操作锁定在指定标签页，禁止该标签页后台休眠 |
-| **JumpServer 执行** | `bctl exec "ps -ef \| grep es"` | 穿透 JumpServer Web 终端执行 Linux 命令并返回干净标准输出 |
+| **页面环境嗅探** | `bctl probe` | 一键嗅探页面当前就绪的终端（Xterm）、编辑器（Monaco/Ace/CodeMirror）与主表单 |
+| **Web 终端执行** | `bctl exec "ps -ef \| grep es"` | 穿透各类 Web 终端 (JumpServer/DOPS/K8s/Xterm) 执行命令并返回标准输出 |
+| **DevTools 执行** | `bctl devtools "GET _cat/indices?v"` | 在 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |
 | **感知视口元素** | `bctl look` | 静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要（不再渲染数字角标） |
 | **执行鼠标/键盘动作** | `bctl act '<JSON动作数组>'` | 执行点击、输入、按键、智能容器滚动（实时在顶部胶囊打印具体动作） |
 | **打印操作状态** | `bctl state "<描述>"` | 在受控页面顶部悬浮胶囊自定义打印当前操作状态（向用户提供清晰的进度回显） |
@@ -207,6 +212,22 @@ bctl act '[{"type":"scroll","deltaY":800}]'
 
 # 3. 查看当前视口提取的表格数据与图表指标
 bctl look
+```
+
+### 场景四：DOPS/K8s 容器终端与 Kibana/ES 控制台执行
+```bash
+# 1. 一键嗅探页面内是否有活跃的终端或编辑器
+bctl bind dops
+bctl probe
+
+# 2. 在非标容器终端 (DOPS / 自研终端) 中直接执行命令
+bctl exec "uname -a"
+bctl exec "ls -la /app"
+
+# 3. 在 Kibana DevTools / 自研 ES 控制台执行 DSL 查询
+bctl bind elasticsearch
+bctl devtools "GET _cat/indices?v"
+bctl devtools 'GET k8s-logs-*/_search\n{"size":5,"query":{"match_all":{}}}'
 ```
 
 ---

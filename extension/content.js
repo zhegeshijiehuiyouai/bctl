@@ -663,6 +663,24 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       }
     }
 
+    // D. 抓取页面活跃 Web 终端与 DevTools 控制台
+    const hasXterm = document.querySelector(".xterm, .xterm-helper-textarea");
+    if (hasXterm) {
+      lines.push("[就绪终端] Web 终端 (Xterm) 已激活，支持 `bctl exec '<cmd>'` 穿透执行");
+    }
+    const hasMonaco = document.querySelector(".monaco-editor");
+    if (hasMonaco) {
+      lines.push("[就绪控制台] Monaco Editor (Kibana / 自研 DevTools) 已就绪，支持 `bctl devtools '<query>'` 执行");
+    }
+    const hasAce = document.querySelector(".ace_editor");
+    if (hasAce) {
+      lines.push("[就绪控制台] Ace Editor (Kibana 经典版) 已就绪，支持 `bctl devtools '<query>'` 执行");
+    }
+    const hasCodeMirror = document.querySelector(".CodeMirror");
+    if (hasCodeMirror) {
+      lines.push("[就绪控制台] CodeMirror 编辑器已就绪，支持 `bctl devtools '<query>'` 执行");
+    }
+
     return lines.length > 0
       ? "\n--- 当前视口可见数据摘要 ---\n" + lines.join("\n")
       : "";

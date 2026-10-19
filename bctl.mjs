@@ -159,7 +159,7 @@ const cmd = args[0];
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
   console.log(`
-bctl - 极简日常 Chrome 控制工具 (支持 JumpServer 终端直连与后台并发)
+bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及后台并发)
 
 命令列表:
   bctl tabs                查看所有已打开的标签页（列出 TabID、标题、URL）
@@ -167,21 +167,26 @@ bctl - 极简日常 Chrome 控制工具 (支持 JumpServer 终端直连与后台
   bctl unbind / release    解除控制并释放绑定的标签页（立即平滑淡出胶囊并恢复原生 Tab 栏图标）
   bctl new <url>           在后台静默打开新标签页并自动绑定（人类前台零干扰）
   bctl open <url>          在当前绑定的标签页打开指定网址并返回元素列表
-  bctl exec "<shell命令>"  在绑定的 JumpServer Web 终端中执行命令并获取输出
-  bctl look                静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要（不再在页面渲染数字角标）
+  bctl exec "<shell命令>"  在绑定的 Web 终端 (JumpServer / DOPS / K8s / Xterm) 中穿透执行命令并获取输出
+  bctl devtools "<查询>"   在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器中填充并执行查询
+  bctl probe               一键嗅探当前页面所有就绪终端、编辑器 (Monaco / Ace / CodeMirror) 与表单
+  bctl look                静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要
   bctl act '<JSON动作数组>' 驱动 ChatGPT 同款弹簧物理鼠标执行动作（支持 click, type, press, scroll, wait）
   bctl state "<描述>"      在受控页面顶部悬浮胶囊打印当前操作描述（如 "正在排查报警..."）
   bctl reload              热重载 Chrome 扩展（开发调试时刷新 content.js 与 background.js）
   bctl status              查看 Chrome 扩展与守护进程连接状态
 
 使用场景:
-  1. 后台操作堡垒机 (不影响你在前台浏览其它网页):
+  1. 后台操作堡垒机或自研 K8s 容器终端 (不影响你在前台浏览其它网页):
      bctl tabs
-     bctl bind jumpserver
-     bctl exec "ps -ef | grep jenkins"
-     bctl exec "systemctl status jenkins"
+     bctl bind jumpserver  # 或 bctl bind dops
+     bctl exec "ps -ef | grep multica"
 
-  2. 普通网页自动化 (带拟人光标与动画):
+  2. 后台操作 Kibana DevTools / 自研 ES 查询控制台:
+     bctl bind elastic
+     bctl devtools "GET _cat/indices?v"
+
+  3. 普通网页自动化 (带拟人光标与动画):
      bctl open https://github.com
      bctl act '[{"type":"type","id":1,"text":"antigravity"},{"type":"press","key":"Enter"}]'
 `);
@@ -220,10 +225,21 @@ if (cmd === "daemon") {
 } else if (cmd === "exec" || cmd === "term-exec") {
   const commandToRun = args.slice(1).join(" ");
   if (!commandToRun) {
-    console.error("用法: bctl exec \"<在 JumpServer 终端中执行的 shell 命令>\"");
+    console.error("用法: bctl exec \"<在 Web 终端 (JumpServer/DOPS/K8s/Xterm) 中执行的 shell 命令>\"");
     process.exit(1);
   }
   const result = await sendCommand("term_exec", { cmd: commandToRun, timeoutMs: 20000 });
+  console.log(result);
+} else if (cmd === "devtools" || cmd === "query" || cmd === "console") {
+  const queryToRun = args.slice(1).join(" ");
+  if (!queryToRun) {
+    console.error("用法: bctl devtools \"<在 Kibana DevTools / Monaco / Ace / ES 控制台中执行的查询语句>\"");
+    process.exit(1);
+  }
+  const result = await sendCommand("devtools_exec", { query: queryToRun, timeoutMs: 25000 });
+  console.log(result);
+} else if (cmd === "probe") {
+  const result = await sendCommand("probe");
   console.log(result);
 } else if (cmd === "look") {
   const result = await sendCommand("look");

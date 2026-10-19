@@ -170,10 +170,10 @@ async function connectWS() {
         return;
       }
 
-      // ─── 动作 3: JumpServer 终端命令穿透执行 (bctl exec) ───
+      // ─── 动作 3: Web 终端命令穿透执行 (bctl exec) ───
       if (action === "term_exec") {
         const cmd = payload.cmd || "";
-        const timeoutMs = payload.timeoutMs || 15000;
+        const timeoutMs = payload.timeoutMs || 20000;
         await ensureContentScript(targetTab.id);
         const cmdSummary = cmd.length > 28 ? cmd.slice(0, 28) + "..." : cmd;
         chrome.tabs.sendMessage(targetTab.id, {
@@ -185,7 +185,7 @@ async function connectWS() {
           target: { tabId: targetTab.id, allFrames: true },
           world: "MAIN",
           args: [cmd, timeoutMs],
-          func: executeInKokoTerminal
+          func: executeInWebTerminal
         });
 
         const hit = results?.find(r => r?.result && r.result.matched === true);
@@ -196,7 +196,7 @@ async function connectWS() {
           }).catch(() => {});
           ws.send(JSON.stringify({
             id,
-            result: `在标签页 [${targetTab.id}] "${targetTab.title}" 中未找到处于可见/激活状态的 JumpServer (Koko) xterm 终端！`
+            result: `在标签页 [${targetTab.id}] "${targetTab.title}" 中未找到处于可见/激活状态的 Web 终端 (支持 JumpServer / DOPS / K8s 容器 / Xterm)！`
           }));
           return;
         }
@@ -214,6 +214,68 @@ async function connectWS() {
             result: `[执行异常/超时] ${hit.result.error || "未知错误"}\n${hit.result.partialOutput || ""}`
           }));
         }
+        return;
+      }
+
+      // ─── 动作 3.5: Kibana DevTools / 自研代码编辑器查询执行 (bctl devtools) ───
+      if (action === "devtools_exec") {
+        const query = payload.query || "";
+        const timeoutMs = payload.timeoutMs || 25000;
+        await ensureContentScript(targetTab.id);
+        const qSummary = query.length > 28 ? query.slice(0, 28).replace(/\n/g, " ") + "..." : query.replace(/\n/g, " ");
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: `正在执行查询: ${qSummary}` }
+        }).catch(() => {});
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, allFrames: true },
+          world: "MAIN",
+          args: [query, timeoutMs],
+          func: executeInDevTools
+        });
+
+        const hit = results?.find(r => r?.result && r.result.matched === true);
+        if (!hit) {
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: "未找到编辑器", autoResetDelay: 2500 }
+          }).catch(() => {});
+          ws.send(JSON.stringify({
+            id,
+            result: `在标签页 [${targetTab.id}] "${targetTab.title}" 中未找到支持的代码/查询编辑器 (支持 Monaco / Ace / CodeMirror / Kibana DevTools)！`
+          }));
+          return;
+        }
+
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: "查询执行完成", autoResetDelay: 2500 }
+        }).catch(() => {});
+
+        if (hit.result.ok) {
+          ws.send(JSON.stringify({ id, result: hit.result.output }));
+        } else {
+          ws.send(JSON.stringify({
+            id,
+            result: `[查询异常/超时] ${hit.result.error || "未知错误"}\n${hit.result.partialOutput || ""}`
+          }));
+        }
+        return;
+      }
+
+      // ─── 动作 3.8: 控制台/终端/编辑器一键探测 (bctl probe) ───
+      if (action === "probe") {
+        await ensureContentScript(targetTab.id);
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, allFrames: true },
+          world: "MAIN",
+          func: probePageInteractiveCapabilities
+        });
+        const combined = results?.map(r => r.result).filter(Boolean) || [];
+        const active = combined.filter(c => (c.terminals && c.terminals.length > 0) || (c.editors && c.editors.length > 0));
+        const finalReport = active.length > 0 ? (active.length === 1 ? active[0] : active) : (combined[0] || { url: targetTab.url, terminals: [], editors: [], inputsCount: 0 });
+        ws.send(JSON.stringify({ id, result: JSON.stringify(finalReport, null, 2) }));
         return;
       }
 
@@ -348,76 +410,98 @@ function waitForTabLoad(tabId) {
   });
 }
 
-// ─── MAIN 世界直连 JumpServer (Koko) xterm 实例的注入函数 ───
-// 关键边界防御：
-// 1. 鸭子类型递归探查 Vue 2 / Vue 3 / window.term
-// 2. 纯净原样命令下发（零 __BCTL_S_ / __BCTL_E_ 标记污染），基于光标行与提示符静默稳定检测完成态
-// 3. isWrapped 软折行拼接还原 + 环形缓冲区 onTrim 滚屏偏移追踪
-// 4. term.onWriteParsed 事件监听配合轮询防后台休眠节流
-// 5. triggerDataEvent 绕过 Bracketed Paste 陷阱
-async function executeInKokoTerminal(cmd, timeoutMs) {
-  const isKokoFrame = location.pathname.includes("/koko/") || document.querySelector(".xterm");
-  if (!isKokoFrame) return { matched: false };
+// ─── MAIN 世界通用 Web 终端 (Xterm / JumpServer / DOPS / K8s) 注入函数 ───
+async function executeInWebTerminal(cmd, timeoutMs) {
+  const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
+  const isTermFrame = location.pathname.includes("/koko/") || location.pathname.includes("/luna/") || allXtermEls.length > 0 || window.term || window.terminal;
+  if (!isTermFrame) return { matched: false };
 
-  const xtermEl = document.querySelector(".xterm");
-  if (!xtermEl || xtermEl.offsetParent === null) return { matched: false };
+  const xtermEl = allXtermEls.find(el => el.offsetParent !== null) || allXtermEls[0];
+  if (!xtermEl && !window.term && !window.terminal) return { matched: false };
 
   function findXtermInstance(startEl) {
     const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
+    
+    // 0. 全局 window 探测
+    if (isTerm(window.term)) return window.term;
+    if (isTerm(window.terminal)) return window.terminal;
+    if (isTerm(window.xterm)) return window.xterm;
+    if (isTerm(window._term)) return window._term;
+
     let el = startEl;
     while (el) {
-      // Vue 2 探测
+      // 1. DOM 属性直接挂载探测 (DOPS / 自研平台常见: modal._terminal, el.term, el._xterm)
+      if (isTerm(el._terminal)) return el._terminal;
+      if (isTerm(el.term)) return el.term;
+      if (isTerm(el._xterm)) return el._xterm;
+      if (isTerm(el.terminal)) return el.terminal;
+      if (isTerm(el.__xterm__)) return el.__xterm__;
+
+      // 2. Vue 2 探测
       if (el.__vue__) {
         if (isTerm(el.__vue__.term)) return el.__vue__.term;
         if (isTerm(el.__vue__.xterm)) return el.__vue__.xterm;
+        if (isTerm(el.__vue__._terminal)) return el.__vue__._terminal;
         for (const val of Object.values(el.__vue__)) {
           if (isTerm(val)) return val;
         }
       }
-      // Vue 3 探测
+      // 3. Vue 3 探测
       const v3 = el.__vueParentComponent;
       if (v3) {
         const pools = [v3.ctx, v3.exposed, v3.setupState, v3.data].filter(Boolean);
         for (const pool of pools) {
           if (isTerm(pool?.term)) return pool.term;
+          if (isTerm(pool?.xterm)) return pool.xterm;
+          if (isTerm(pool?._terminal)) return pool._terminal;
           for (const val of Object.values(pool)) {
             if (isTerm(val)) return val;
           }
         }
       }
+      // 4. React Fiber 探测 (现代 React 弹窗/容器)
+      for (const k in el) {
+        if (k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")) {
+          let cur = el[k];
+          let depth = 0;
+          while (cur && depth < 12) {
+            if (cur.stateNode) {
+              if (isTerm(cur.stateNode.term)) return cur.stateNode.term;
+              if (isTerm(cur.stateNode.xterm)) return cur.stateNode.xterm;
+              if (isTerm(cur.stateNode._terminal)) return cur.stateNode._terminal;
+            }
+            if (cur.memoizedState) {
+              let s = cur.memoizedState;
+              while (s) {
+                if (isTerm(s.memoizedState?.current)) return s.memoizedState.current;
+                if (isTerm(s.memoizedState)) return s.memoizedState;
+                s = s.next;
+              }
+            }
+            cur = cur.return;
+            depth++;
+          }
+        }
+      }
+
       el = el.parentElement;
     }
-    return window.term && isTerm(window.term) ? window.term : null;
-  }
 
-  const term = findXtermInstance(xtermEl);
-  if (!term) return { matched: false };
+    // 5. 页面弹窗容器集中探查
+    const modals = document.querySelectorAll('.modal, .modal-mask, [class*="modal"], [class*="dialog"], [role="dialog"]');
+    for (const m of modals) {
+      if (isTerm(m._terminal)) return m._terminal;
+      if (isTerm(m.term)) return m.term;
+      if (isTerm(m._xterm)) return m._xterm;
+      if (isTerm(m.terminal)) return m.terminal;
+    }
+
+    return null;
+  }
 
   const cleanCmd = cmd.replace(/[\r\n]+$/, "");
   const cmdLines = cleanCmd.split(/\r?\n/);
   const rawInput = `${cleanCmd}\r`;
-
-  function extractLogicalLines(buffer, fromRow, toRow) {
-    const maxIdx = Math.min(buffer.length - 1, toRow);
-    const logicalLines = [];
-    let currentLine = "";
-
-    for (let i = Math.max(0, fromRow); i <= maxIdx; i++) {
-      const line = buffer.getLine(i);
-      if (!line) continue;
-      const nextLine = i + 1 <= maxIdx ? buffer.getLine(i + 1) : null;
-      const isNextWrapped = Boolean(nextLine && nextLine.isWrapped);
-
-      // 软折行还原
-      currentLine += line.translateToString(!isNextWrapped);
-      if (!isNextWrapped) {
-        logicalLines.push(currentLine);
-        currentLine = "";
-      }
-    }
-    if (currentLine) logicalLines.push(currentLine);
-    return logicalLines;
-  }
 
   function isInteractivePrompt(trimmed) {
     if (!trimmed) return false;
@@ -429,148 +513,434 @@ async function executeInKokoTerminal(cmd, timeoutMs) {
   function isShellPrompt(trimmed, initPrompt) {
     if (!trimmed) return false;
     if (initPrompt && trimmed === initPrompt) return true;
-    // 常见 Linux/Unix Shell 提示符: [user@host dir]# / $ 或 user@host:dir# / $ 等
     if (/^(?:\([^)]+\)\s*)*\[[^\]]+@[^\]]+\]\s*[#$%>]\s*$/.test(trimmed)) return true;
     if (/^(?:\([^)]+\)\s*)*[^\s@]+@[^\s:]+:[^\s]*\s*[#$%>]\s*$/.test(trimmed)) return true;
     if (/^(?:sh|bash|zsh|csh|ksh|dash|ash)(?:-[\d.]+)?\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/[#$%>]\s*$/.test(trimmed) && !trimmed.endsWith("==")) return true;
     if (/^(?:mysql|redis[^›>]*|postgres[^›>]*|sqlite3?)\s*>\s*$/i.test(trimmed)) return true;
     if (isInteractivePrompt(trimmed)) return true;
     return false;
   }
 
-  const activeBuf = term.buffer.active;
-  let startRow = activeBuf.baseY + activeBuf.cursorY;
-  while (startRow > 0 && activeBuf.getLine(startRow)?.isWrapped) {
-    startRow--;
-  }
+  const term = findXtermInstance(xtermEl);
 
-  const initialPromptLines = extractLogicalLines(activeBuf, Math.max(0, startRow - 2), activeBuf.baseY + activeBuf.cursorY);
-  const tailText = initialPromptLines.join("\n");
-  if (/Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tailText)) {
-    return {
-      matched: true,
-      ok: false,
-      error: "当前 JumpServer Web 终端连接已断开 (Connection websocket closed)，请重新连接资产后再执行命令",
-      partialOutput: tailText,
-    };
-  }
-  const initialPrompt = (extractLogicalLines(activeBuf, startRow, activeBuf.baseY + activeBuf.cursorY)[0] || "").trim();
+  // ─── 分支 A: 找到 term 实例，走高精度 Buffer 解析模式 ───
+  if (term) {
+    function extractLogicalLines(buffer, fromRow, toRow) {
+      const maxIdx = Math.min(buffer.length - 1, toRow);
+      const logicalLines = [];
+      let currentLine = "";
 
-  return new Promise((resolve) => {
-    let writeDisposable = null;
-    let trimDisposable = null;
-    let settleTimer = null;
-    let pollTimer = null;
-    let finished = false;
+      for (let i = Math.max(0, fromRow); i <= maxIdx; i++) {
+        const line = buffer.getLine(i);
+        if (!line) continue;
+        const nextLine = i + 1 <= maxIdx ? buffer.getLine(i + 1) : null;
+        const isNextWrapped = Boolean(nextLine && nextLine.isWrapped);
 
-    const cleanup = () => {
-      finished = true;
-      clearTimeout(timeoutTimer);
-      if (settleTimer) clearTimeout(settleTimer);
-      if (pollTimer) clearInterval(pollTimer);
-      if (writeDisposable && typeof writeDisposable.dispose === "function") writeDisposable.dispose();
-      if (trimDisposable && typeof trimDisposable.dispose === "function") trimDisposable.dispose();
-    };
-
-    // 追踪环形缓冲区满载时的顶部裁剪行数，保持 startRow 精确对齐
-    const rawLineList =
-      term._core?._bufferService?.buffer?.lines ||
-      term._core?.buffer?.lines ||
-      term.buffer?.active?._buffer?.lines;
-    if (rawLineList && typeof rawLineList.onTrim === "function") {
-      trimDisposable = rawLineList.onTrim((amount) => {
-        startRow = Math.max(0, startRow - amount);
-      });
-    }
-
-    const sliceCleanOutput = (lines) => {
-      if (lines.length === 0) return "";
-      let outStart = 1;
-      for (let k = 1; k < cmdLines.length && outStart < lines.length - 1; k++) {
-        const rawEcho = lines[outStart];
-        const strippedEcho = rawEcho.replace(/^>\s?/, "").trim();
-        const expected = cmdLines[k].trim();
-        if (strippedEcho === expected || rawEcho.trim() === expected) {
-          outStart++;
-        } else {
-          break;
+        currentLine += line.translateToString(!isNextWrapped);
+        if (!isNextWrapped) {
+          logicalLines.push(currentLine);
+          currentLine = "";
         }
       }
-      const lastTrimmed = lines[lines.length - 1].trim();
-      const outEnd = isInteractivePrompt(lastTrimmed) ? lines.length : Math.max(outStart, lines.length - 1);
-      return lines.slice(outStart, outEnd).join("\n").trim();
-    };
+      if (currentLine) logicalLines.push(currentLine);
+      return logicalLines;
+    }
+
+    const activeBuf = term.buffer.active;
+    let startRow = activeBuf.baseY + activeBuf.cursorY;
+    while (startRow > 0 && activeBuf.getLine(startRow)?.isWrapped) {
+      startRow--;
+    }
+
+    const initialPromptLines = extractLogicalLines(activeBuf, Math.max(0, startRow - 2), activeBuf.baseY + activeBuf.cursorY);
+    const tailText = initialPromptLines.join("\n");
+    if (/Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tailText)) {
+      return {
+        matched: true,
+        ok: false,
+        error: "当前 Web 终端连接已断开 (Connection closed)，请重新连接后再执行命令",
+        partialOutput: tailText,
+      };
+    }
+    const initialPrompt = (extractLogicalLines(activeBuf, startRow, activeBuf.baseY + activeBuf.cursorY)[0] || "").trim();
+
+    return new Promise((resolve) => {
+      let writeDisposable = null;
+      let trimDisposable = null;
+      let settleTimer = null;
+      let pollTimer = null;
+      let finished = false;
+
+      const cleanup = () => {
+        finished = true;
+        clearTimeout(timeoutTimer);
+        if (settleTimer) clearTimeout(settleTimer);
+        if (pollTimer) clearInterval(pollTimer);
+        if (writeDisposable && typeof writeDisposable.dispose === "function") writeDisposable.dispose();
+        if (trimDisposable && typeof trimDisposable.dispose === "function") trimDisposable.dispose();
+      };
+
+      const rawLineList =
+        term._core?._bufferService?.buffer?.lines ||
+        term._core?.buffer?.lines ||
+        term.buffer?.active?._buffer?.lines;
+      if (rawLineList && typeof rawLineList.onTrim === "function") {
+        trimDisposable = rawLineList.onTrim((amount) => {
+          startRow = Math.max(0, startRow - amount);
+        });
+      }
+
+      const sliceCleanOutput = (lines) => {
+        if (lines.length === 0) return "";
+        let outStart = 1;
+        for (let k = 1; k < cmdLines.length && outStart < lines.length - 1; k++) {
+          const rawEcho = lines[outStart];
+          const strippedEcho = rawEcho.replace(/^>\s?/, "").trim();
+          const expected = cmdLines[k].trim();
+          if (strippedEcho === expected || rawEcho.trim() === expected) {
+            outStart++;
+          } else {
+            break;
+          }
+        }
+        const lastTrimmed = lines[lines.length - 1].trim();
+        const outEnd = isInteractivePrompt(lastTrimmed) ? lines.length : Math.max(outStart, lines.length - 1);
+        return lines.slice(outStart, outEnd).join("\n").trim();
+      };
+
+      const timeoutTimer = setTimeout(() => {
+        if (finished) return;
+        const buf = term.buffer.active;
+        const curY = buf.baseY + buf.cursorY;
+        const lines = extractLogicalLines(buf, Math.max(0, startRow - 5), curY);
+        const partial = lines.join("\n");
+        cleanup();
+        resolve({
+          matched: true,
+          ok: false,
+          error: `指令在 ${timeoutMs}ms 内未执行完（可能卡在交互式输入或耗时命令）`,
+          partialOutput: partial.slice(-2000),
+        });
+      }, timeoutMs);
+
+      const finalizeIfReady = () => {
+        if (finished) return;
+        const buf = term.buffer.active;
+        const curY = buf.baseY + buf.cursorY;
+        const lines = extractLogicalLines(buf, startRow, curY);
+        if (lines.length < cmdLines.length + 1) return;
+
+        const lastTrimmed = lines[lines.length - 1].trim();
+        if (!isShellPrompt(lastTrimmed, initialPrompt)) return;
+
+        const output = sliceCleanOutput(lines);
+        cleanup();
+        resolve({
+          matched: true,
+          ok: true,
+          exitCode: 0,
+          output,
+        });
+      };
+
+      const checkBuffer = () => {
+        if (finished) return;
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+          settleTimer = null;
+        }
+
+        const buf = term.buffer.active;
+        const curY = buf.baseY + buf.cursorY;
+        if (startRow > curY) startRow = curY;
+
+        const lines = extractLogicalLines(buf, startRow, curY);
+        if (lines.length < cmdLines.length + 1) return;
+
+        const lastTrimmed = lines[lines.length - 1].trim();
+        if (isShellPrompt(lastTrimmed, initialPrompt)) {
+          settleTimer = setTimeout(finalizeIfReady, 120);
+        }
+      };
+
+      if (typeof term.onWriteParsed === "function") {
+        writeDisposable = term.onWriteParsed(checkBuffer);
+      }
+      pollTimer = setInterval(() => {
+        if (!settleTimer) checkBuffer();
+      }, 150);
+
+      if (term._core?.coreService?.triggerDataEvent) {
+        term._core.coreService.triggerDataEvent(rawInput, true);
+      } else {
+        term.paste(rawInput);
+      }
+    });
+  }
+
+  // ─── 分支 B: 未暴露 term 实例时，走通用 DOM 模拟降级模式 ───
+  const helper = document.querySelector(".xterm-helper-textarea");
+  if (!helper) return { matched: false };
+
+  return new Promise((resolve) => {
+    function getScreenLines() {
+      return Array.from(document.querySelectorAll(".xterm-rows > div"))
+        .map(d => d.innerText.replace(/\u00a0/g, " ").trim())
+        .filter(Boolean);
+    }
+
+    const beforeLines = getScreenLines();
+    const initialPrompt = (beforeLines[beforeLines.length - 1] || "").trim();
+
+    helper.focus();
+    let sent = false;
+    try {
+      sent = document.execCommand("insertText", false, rawInput);
+    } catch (_) {}
+    if (!sent) {
+      helper.value = rawInput;
+      helper.dispatchEvent(new InputEvent("input", { bubbles: true, data: rawInput, inputType: "insertText" }));
+      helper.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+    }
+
+    let settleTimer = null;
+    let finished = false;
 
     const timeoutTimer = setTimeout(() => {
       if (finished) return;
-      const buf = term.buffer.active;
-      const curY = buf.baseY + buf.cursorY;
-      const lines = extractLogicalLines(buf, Math.max(0, startRow - 5), curY);
-      const partial = lines.join("\n");
-      cleanup();
+      finished = true;
+      clearInterval(pollInterval);
+      const after = getScreenLines();
       resolve({
         matched: true,
         ok: false,
-        error: `指令在 ${timeoutMs}ms 内未执行完（可能卡在交互式输入或耗时命令）`,
-        partialOutput: partial.slice(-2000),
+        error: `指令在 ${timeoutMs}ms 内未执行完`,
+        partialOutput: after.slice(-15).join("\n")
       });
     }, timeoutMs);
 
-    const finalizeIfReady = () => {
+    const pollInterval = setInterval(() => {
       if (finished) return;
-      const buf = term.buffer.active;
-      const curY = buf.baseY + buf.cursorY;
-      const lines = extractLogicalLines(buf, startRow, curY);
-      if (lines.length < cmdLines.length + 1) return;
-
-      const lastTrimmed = lines[lines.length - 1].trim();
-      if (!isShellPrompt(lastTrimmed, initialPrompt)) return;
-
-      const output = sliceCleanOutput(lines);
-      cleanup();
-      resolve({
-        matched: true,
-        ok: true,
-        exitCode: 0,
-        output,
-      });
-    };
-
-    const checkBuffer = () => {
-      if (finished) return;
-      if (settleTimer) {
-        clearTimeout(settleTimer);
-        settleTimer = null;
+      const currentLines = getScreenLines();
+      if (currentLines.length === 0) return;
+      const lastLine = currentLines[currentLines.length - 1] || "";
+      if (isShellPrompt(lastLine, initialPrompt)) {
+        if (!settleTimer) {
+          settleTimer = setTimeout(() => {
+            finished = true;
+            clearInterval(pollInterval);
+            clearTimeout(timeoutTimer);
+            const finalLines = getScreenLines();
+            let startIdx = 0;
+            for (let i = 0; i < finalLines.length; i++) {
+              if (finalLines[i].includes(cleanCmd)) {
+                startIdx = i + 1;
+                break;
+              }
+            }
+            const outLines = finalLines.slice(startIdx, Math.max(startIdx, finalLines.length - 1));
+            resolve({
+              matched: true,
+              ok: true,
+              output: outLines.join("\n").trim()
+            });
+          }, 200);
+        }
+      } else {
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+          settleTimer = null;
+        }
       }
-
-      const buf = term.buffer.active;
-      const curY = buf.baseY + buf.cursorY;
-      if (startRow > curY) startRow = curY;
-
-      const lines = extractLogicalLines(buf, startRow, curY);
-      if (lines.length < cmdLines.length + 1) return;
-
-      const lastTrimmed = lines[lines.length - 1].trim();
-      if (isShellPrompt(lastTrimmed, initialPrompt)) {
-        // 提示符出现后等待 120ms 静默稳定期，确保多段输出或长回显完全落盘
-        settleTimer = setTimeout(finalizeIfReady, 120);
-      }
-    };
-
-    if (typeof term.onWriteParsed === "function") {
-      writeDisposable = term.onWriteParsed(checkBuffer);
-    }
-    pollTimer = setInterval(() => {
-      if (!settleTimer) checkBuffer();
     }, 150);
-
-    // 优先使用底层 triggerDataEvent 绕过 Bracketed Paste 陷阱，直接下发纯净明文命令
-    if (term._core?.coreService?.triggerDataEvent) {
-      term._core.coreService.triggerDataEvent(rawInput, true);
-    } else {
-      term.paste(rawInput);
-    }
   });
+}
+
+// ─── MAIN 世界 Kibana DevTools / Monaco / Ace / CodeMirror 查询执行注入函数 ───
+async function executeInDevTools(query, timeoutMs) {
+  function triggerRun(activeEl) {
+    const playBtn = Array.from(document.querySelectorAll('button, a.btn, [role="button"], span, i')).find(b => {
+      if (b.offsetParent === null) return false;
+      const text = (b.innerText || b.getAttribute("title") || b.getAttribute("aria-label") || "").trim();
+      return /^(运行|执行|查询|Run|Submit|Search)$/i.test(text) ||
+             /play|submit|execute/i.test(b.className);
+    }) || document.querySelector('.euiButtonIcon--primary, button[title*="Submit" i], button[title*="运行"], button[title*="执行"], button[title*="查询"]');
+
+    if (playBtn && playBtn.offsetParent !== null) {
+      playBtn.click();
+      return;
+    }
+    const target = activeEl || document.activeElement || document.body;
+    const isMac = navigator.platform.toUpperCase().includes("MAC");
+    const evt = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    if (isMac) evt.metaKey = true;
+    else evt.ctrlKey = true;
+    target.dispatchEvent(new KeyboardEvent("keydown", evt));
+    target.dispatchEvent(new KeyboardEvent("keyup", evt));
+  }
+
+  function getConsoleResponseText() {
+    // 1. Monaco 只读响应编辑器
+    if (window.monaco?.editor?.getEditors()?.length > 1) {
+      const eds = window.monaco.editor.getEditors();
+      const readOnlyEd = eds.find(ed => ed.getOption?.(monaco.editor.EditorOption.readOnly)) || eds[1];
+      if (readOnlyEd) return readOnlyEd.getValue();
+    }
+    // 2. Ace 只读响应编辑器
+    const aceEls = document.querySelectorAll(".ace_editor");
+    if (aceEls.length > 1 && window.ace?.edit) {
+      return window.ace.edit(aceEls[1]).getValue();
+    }
+    // 3. CodeMirror 响应视口
+    const cmEls = document.querySelectorAll(".cm-editor, .CodeMirror");
+    if (cmEls.length > 1) {
+      return (cmEls[1].innerText || "").trim();
+    }
+    // 4. 通用输出视口
+    const out = document.querySelector('.response, [class*="response" i], [class*="result-pane" i], [class*="result" i], [class*="output" i], .json-viewer, pre, code');
+    return out ? (out.innerText || "").trim() : "";
+  }
+
+  async function waitForChange(initialText, limitMs) {
+    const start = Date.now();
+    let prev = initialText;
+    while (Date.now() - start < limitMs) {
+      await new Promise(r => setTimeout(r, 200));
+      const cur = getConsoleResponseText();
+      if (cur && cur !== initialText && cur.length > 0) {
+        await new Promise(r => setTimeout(r, 150));
+        return getConsoleResponseText();
+      }
+    }
+    return getConsoleResponseText();
+  }
+
+  // 1. Monaco Editor 探测 (现代 Kibana / 自研 ES 控制台)
+  if (window.monaco?.editor?.getEditors()?.length > 0) {
+    const editors = window.monaco.editor.getEditors();
+    const targetEditor = editors.find(ed => {
+      const dom = ed.getDomNode?.();
+      return dom && dom.offsetParent !== null && !ed.getOption?.(monaco.editor.EditorOption.readOnly);
+    }) || editors[0];
+
+    const initialOutput = getConsoleResponseText();
+    targetEditor.setValue(query);
+    targetEditor.focus();
+    triggerRun(targetEditor.getDomNode());
+
+    const result = await waitForChange(initialOutput, timeoutMs);
+    return { matched: true, ok: true, output: result || "已执行查询" };
+  }
+
+  // 2. Ace Editor 探测 (经典版 Kibana DevTools)
+  const aceEl = document.querySelector(".ace_editor");
+  if (aceEl && window.ace?.edit) {
+    const editor = window.ace.edit(aceEl);
+    const initialOutput = getConsoleResponseText();
+    editor.setValue(query);
+    editor.clearSelection();
+    editor.focus();
+    triggerRun(aceEl);
+
+    const result = await waitForChange(initialOutput, timeoutMs);
+    return { matched: true, ok: true, output: result || "已执行查询" };
+  }
+
+  // 3. CodeMirror 5 探测
+  const cmEl = document.querySelector(".CodeMirror");
+  if (cmEl && cmEl.CodeMirror) {
+    const cm = cmEl.CodeMirror;
+    const initialOutput = getConsoleResponseText();
+    cm.setValue(query);
+    cm.focus();
+    triggerRun(cmEl);
+
+    const result = await waitForChange(initialOutput, timeoutMs);
+    return { matched: true, ok: true, output: result || "已执行查询" };
+  }
+
+  // 4. CodeMirror 6 探测
+  const cm6El = document.querySelector(".cm-editor .cm-content");
+  if (cm6El) {
+    const initialOutput = getConsoleResponseText();
+    cm6El.focus();
+    document.execCommand("selectAll", false, null);
+    document.execCommand("insertText", false, query);
+    triggerRun(cm6El);
+
+    const result = await waitForChange(initialOutput, timeoutMs);
+    return { matched: true, ok: true, output: result || "已执行查询" };
+  }
+
+  // 5. 自研控制台常见 query textarea 探测
+  const queryTa = document.querySelector('textarea[class*="query" i], textarea[class*="editor" i], textarea[placeholder*="query" i], textarea[placeholder*="DSL" i], textarea[placeholder*="JSON" i], textarea[placeholder*="查询" i]');
+  if (queryTa && queryTa.offsetParent !== null) {
+    const initialOutput = getConsoleResponseText();
+    queryTa.focus();
+    queryTa.value = query;
+    queryTa.dispatchEvent(new Event("input", { bubbles: true }));
+    queryTa.dispatchEvent(new Event("change", { bubbles: true }));
+    triggerRun(queryTa);
+
+    const result = await waitForChange(initialOutput, timeoutMs);
+    return { matched: true, ok: true, output: result || "已执行查询" };
+  }
+
+  return { matched: false };
+}
+
+// ─── MAIN 世界控制台/终端一键探测注入函数 ───
+function probePageInteractiveCapabilities() {
+  const result = {
+    url: location.href,
+    terminals: [],
+    editors: [],
+    inputsCount: document.querySelectorAll("input:not([type='hidden']), textarea, [contenteditable='true']").length
+  };
+
+  const xtermEls = document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]");
+  if (xtermEls.length > 0 || window.term || window.terminal) {
+    result.terminals.push({
+      type: "Xterm / Web Terminal",
+      count: xtermEls.length,
+      visible: Array.from(xtermEls).some(el => el.offsetParent !== null),
+      instruction: "可用 `bctl exec '<cmd>'` 穿透执行命令"
+    });
+  }
+
+  if (window.monaco?.editor?.getEditors()?.length > 0 || document.querySelector(".monaco-editor")) {
+    result.editors.push({
+      type: "Monaco (Kibana / 自研 DevTools)",
+      instances: window.monaco?.editor?.getEditors()?.length || document.querySelectorAll(".monaco-editor").length,
+      instruction: "可用 `bctl devtools '<query>'` 填充并执行查询"
+    });
+  }
+
+  if (document.querySelector(".ace_editor") || window.ace?.edit) {
+    result.editors.push({
+      type: "Ace Editor (Kibana 经典版)",
+      instruction: "可用 `bctl devtools '<query>'` 填充并执行查询"
+    });
+  }
+
+  if (document.querySelector(".CodeMirror")?.CodeMirror || document.querySelector(".cm-editor")) {
+    result.editors.push({
+      type: document.querySelector(".cm-editor") ? "CodeMirror 6" : "CodeMirror",
+      instruction: "可用 `bctl devtools '<query>'` 填充并执行查询"
+    });
+  }
+
+  const queryTa = document.querySelector('textarea[class*="query" i], textarea[class*="editor" i], textarea[placeholder*="query" i], textarea[placeholder*="DSL" i], textarea[placeholder*="JSON" i], textarea[placeholder*="查询" i]');
+  if (queryTa && queryTa.offsetParent !== null) {
+    result.editors.push({
+      type: "Query Textarea (自研控制台输入框)",
+      selector: queryTa.className || queryTa.id,
+      instruction: "可用 `bctl devtools '<query>'` 填充并执行查询"
+    });
+  }
+
+  return result;
 }
 
 // 借鉴 ChatGPT handleTabActivated 机制：人类主动切入标签页时，平滑恢复正常
