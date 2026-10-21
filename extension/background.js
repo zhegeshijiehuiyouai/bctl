@@ -1,9 +1,9 @@
 let ws = null;
 const WS_URL = "ws://127.0.0.1:9223";
 
-const CONTROL_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟超时兜底
+const CONTROL_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 小时超时兜底（避免长任务/等待人工操作时误解绑）
 
-// 1. 保活报警器（MV3 Service Worker 闲置 30 秒休眠防断连，兼顾 10 分钟闲置超时兜底）
+// 1. 保活报警器（MV3 Service Worker 闲置 30 秒休眠防断连，兼顾 2 小时闲置超时兜底）
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.3 });
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "keepAlive") {
@@ -13,11 +13,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       ws.send(JSON.stringify({ type: "pong" }));
     }
 
-    // 10 分钟超时兜底：检查是否超过 10 分钟未收到大模型任何操作
+    // 2 小时超时兜底：检查是否超过 2 小时未收到大模型任何操作
     try {
       const { boundTabId, lastActivityTime } = await chrome.storage.session.get(["boundTabId", "lastActivityTime"]);
       if (boundTabId && lastActivityTime && (Date.now() - lastActivityTime > CONTROL_TIMEOUT_MS)) {
-        console.log(`[bctl] 超过 10 分钟无大模型操作，触发超时兜底自动解绑标签页: ${boundTabId}`);
+        console.log(`[bctl] 超过 2 小时无大模型操作，触发超时兜底自动解绑标签页: ${boundTabId}`);
         chrome.tabs.sendMessage(boundTabId, { action: "hide_control_state" }).catch(() => {});
         await chrome.tabs.update(boundTabId, { autoDiscardable: true }).catch(() => {});
         await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
@@ -92,24 +92,39 @@ async function connectWS() {
 
       // ─── 动作 2: 绑定指定标签页 (bctl bind <id|keyword>) ───
       if (action === "bind") {
-        const target = (payload.target || "").toString().trim().toLowerCase();
+        const rawTarget = (payload.target || "").toString().trim();
+        const targetLower = rawTarget.toLowerCase();
         const allTabs = await chrome.tabs.query({});
         let matchedTab = null;
 
-        // 先按 ID 匹配，再按标题/URL 关键词模糊匹配
-        const targetId = parseInt(target, 10);
-        if (!isNaN(targetId)) {
+        // 1. 若输入为纯数字，严格按 Tab ID 精确匹配
+        if (/^\d+$/.test(rawTarget)) {
+          const targetId = parseInt(rawTarget, 10);
           matchedTab = allTabs.find(t => t.id === targetId);
-        }
-        if (!matchedTab && target) {
-          matchedTab = allTabs.find(t =>
-            (t.title && t.title.toLowerCase().includes(target)) ||
-            (t.url && t.url.toLowerCase().includes(target))
+          if (!matchedTab) {
+            ws.send(JSON.stringify({ id, result: `未找到 TabID 为 [${targetId}] 的标签页，请先运行 bctl tabs 查看当前可用标签页` }));
+            return;
+          }
+        } else if (rawTarget) {
+          // 2. 输入为关键词，按标题/URL 模糊匹配；若匹配到多个则报错拦截，彻底杜绝串台
+          const matchedTabs = allTabs.filter(t =>
+            (t.title && t.title.toLowerCase().includes(targetLower)) ||
+            (t.url && t.url.toLowerCase().includes(targetLower))
           );
+
+          if (matchedTabs.length > 1) {
+            const listStr = matchedTabs.map(t => `  - [${t.id}] ${t.title || "(无标题)"} (${t.url || ""})`).join("\n");
+            ws.send(JSON.stringify({
+              id,
+              result: `[多实例冲突拦截] 关键词 "${rawTarget}" 匹配到 ${matchedTabs.length} 个标签页！为防止串台误操作，请使用精准 TabID 绑定：\n${listStr}\n\n示例: bctl bind ${matchedTabs[0].id}`
+            }));
+            return;
+          }
+          matchedTab = matchedTabs[0] || null;
         }
 
         if (!matchedTab) {
-          ws.send(JSON.stringify({ id, result: `未找到匹配 "${target}" 的标签页，请先运行 bctl tabs 查看当前标签列表` }));
+          ws.send(JSON.stringify({ id, result: `未找到匹配 "${rawTarget}" 的标签页，请先运行 bctl tabs 查看当前标签列表` }));
           return;
         }
 
@@ -163,9 +178,28 @@ async function connectWS() {
       // 刷新活跃时间戳
       chrome.storage.session.set({ lastActivityTime: Date.now() }).catch(() => {});
 
-      // 获取当前控制目标 Tab（优先使用绑定的后台 Tab）
-      const targetTab = await getTargetTab();
+      // 强校验：执行与终端交互类动作必须严格绑定后台标签页，严禁盲目降级回退到前台活动标签
+      const REQUIRE_BOUND_ACTIONS = new Set([
+        "term_exec",
+        "devtools_exec",
+        "act",
+        "open",
+        "term_connect",
+        "term_switch",
+        "term_tabs",
+        "subtabs"
+      ]);
+
+      const needBound = REQUIRE_BOUND_ACTIONS.has(action);
+      const targetTab = await getTargetTab(needBound);
       if (!targetTab) {
+        if (needBound) {
+          ws.send(JSON.stringify({
+            id,
+            result: `[安全拦截] 当前未绑定任何后台标签页！为防止向人类前台正在浏览的页面或其它终端误发命令，执行与终端交互类操作严禁未绑定运行。请先使用 bctl tabs 查看并用 bctl bind <TabID> 显式锁定目标。`
+          }));
+          return;
+        }
         ws.send(JSON.stringify({ id, result: "未找到可用标签页！请先执行 bctl tabs 查看并用 bctl bind 绑定" }));
         return;
       }
@@ -677,17 +711,20 @@ async function connectWS() {
 }
 
 // 获取操作目标 Tab
-async function getTargetTab() {
+async function getTargetTab(requireBound = false) {
   const { boundTabId } = await chrome.storage.session.get("boundTabId");
   if (boundTabId) {
     try {
       const tab = await chrome.tabs.get(boundTabId);
       if (tab) return tab;
     } catch (e) {
-      await chrome.storage.session.remove("boundTabId");
+      await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
     }
   }
-  // 未绑定时回退到当前活动窗口的标签页
+  if (requireBound) {
+    return null;
+  }
+  // 未绑定时回退到当前活动窗口的标签页 (仅供 look/probe 等只读探测兜底使用)
   const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (activeTab) return activeTab;
   const [anyActive] = await chrome.tabs.query({ active: true });

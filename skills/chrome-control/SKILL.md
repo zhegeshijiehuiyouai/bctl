@@ -10,7 +10,7 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 ## 工作流与命令速查
 
 1. **打开新页面**：用 `bctl new "<url>"` 在后台新建并自动绑定标签页。
-2. **接管已有页面 / 终端 / 控制台**：先 `bctl tabs` 查列表，再 `bctl bind <关键词|TabID>` 锁定目标。
+2. **接管已有页面 / 终端 / 控制台**：先 `bctl tabs` 查列表，再 `bctl bind <TabID>` 锁定目标（**强烈推荐优先使用纯数字 TabID 绑定**，避免多堡垒机/多实例通用关键词串台冲突；执行类命令未绑定时会自动安全拦截）。
 3. **嗅探可交互能力**：如遇非标 Web 终端或复杂控制台，运行 `bctl probe` 快速探测终端与编辑器实例。
 4. **释放控制权**：所有网页操作完成后，**最后必须执行 `bctl unbind`**。
 
@@ -18,7 +18,7 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 | :--- | :--- |
 | `bctl new "<url>"` | 后台新建标签页、自动绑定并返回页面元素摘要 |
 | `bctl tabs` | 列出所有标签页（TabID、标题、URL、绑定与前台状态） |
-| `bctl bind <关键词\|TabID>` | 绑定指定标签页并关闭后台休眠（如 `bctl bind jumpserver`、`bctl bind dops`） |
+| `bctl bind <TabID\|关键词>` | 绑定指定标签页并关闭后台休眠（推荐 `bctl bind <TabID>`；关键词匹配到多实例时将自动拦截报警） |
 | `bctl subtabs` / `terms` | 列出当前页面内嵌的终端标签列表与健康状态（支持 JumpServer 等多标签终端） |
 | `bctl switch <IP\|序号>` | 在当前页面直接切换到指定的内嵌终端标签页（如切浏览器标签一样无缝切换） |
 | `bctl connect <IP> [--new]` | 智能按需连接（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
