@@ -159,6 +159,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 | **查看标签页** | `bctl tabs` | 查看 Chrome 当前所有已打开的标签（包含 TabID、标题、URL、绑定状态） |
 | **后台打开网页** | `bctl new "https://github.com"` | **强烈推荐**：在后台静默创建标签页并自动绑定，前台人类视角 0 干扰 |
 | **锁定控制目标** | `bctl bind jumpserver` 或 `bctl bind 947878209` | 将后续操作锁定在指定标签页，禁止该标签页后台休眠 |
+| **内嵌终端标签列表** | `bctl subtabs` (或 `terms`) | 查看当前页面内嵌的终端标签列表与连接健康状态 (JumpServer 等多标签终端) |
+| **内嵌终端标签切换** | `bctl switch <IP\|序号>` | 在当前页面像切浏览器标签一样直接切换内嵌终端，零重复新开 |
+| **智能按需连接** | `bctl connect <IP> [--new]` | 智能按需连接主机（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
 | **页面环境嗅探** | `bctl probe` | 一键嗅探页面当前就绪的终端（Xterm）、编辑器（Monaco/Ace/CodeMirror）与主表单 |
 | **Web 终端执行** | `bctl exec "ps -ef \| grep es"` | 穿透各类 Web 终端 (JumpServer/DOPS/K8s/Xterm) 执行命令并返回标准输出 |
 | **DevTools 执行** | `bctl devtools "GET _cat/indices?v"` | 在 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |

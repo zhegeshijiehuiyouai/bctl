@@ -19,6 +19,9 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 | `bctl new "<url>"` | 后台新建标签页、自动绑定并返回页面元素摘要 |
 | `bctl tabs` | 列出所有标签页（TabID、标题、URL、绑定与前台状态） |
 | `bctl bind <关键词\|TabID>` | 绑定指定标签页并关闭后台休眠（如 `bctl bind jumpserver`、`bctl bind dops`） |
+| `bctl subtabs` / `terms` | 列出当前页面内嵌的终端标签列表与健康状态（支持 JumpServer 等多标签终端） |
+| `bctl switch <IP\|序号>` | 在当前页面直接切换到指定的内嵌终端标签页（如切浏览器标签一样无缝切换） |
+| `bctl connect <IP> [--new]` | 智能按需连接（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
 | `bctl probe` | 一键嗅探页面当前就绪的终端（Xterm）、编辑器（Monaco/Ace/CodeMirror）与主表单 |
 | `bctl exec '<shell命令>'` | 在绑定的 Web 终端 (JumpServer/DOPS/K8s/自研 Xterm) 穿透执行命令并返回标准输出 |
 | `bctl devtools "<查询>"` | 在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |
@@ -56,10 +59,16 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
   - **活跃表单输入控件**。
 - `bctl look` 也会在底部自动附带 `[页面内嵌代码/查询编辑器]` 与 `[页面内嵌 Web 终端]` 的状态标识。
 
-### 2. Web 终端命令下发 (`bctl exec`)
-- 支持 JumpServer (Luna/Koko)、K8s 容器终端 (DOPS / Rancher / Kubernetes Dashboard)、基于 Xterm.js 的各类自研 Web 终端。
-- 自动递归 iframe、穿透 Vue/React 虚拟 DOM 挂载的 `term` 实例；当 JavaScript 内存变量未暴露时，自动退化为极速聚焦 `.xterm-helper-textarea` + 拟真键入驱动，兼顾所有非标终端。
-- 终端连接目标服务器后，直接调用 `bctl exec '<shell命令>'`。
+### 2. Web 终端连接与命令下发 (`bctl connect` / `bctl switch` / `bctl exec`)
+- **多标签感知与智能复用（严禁盲目新开）**：
+  - 访问 JumpServer 资产时，**严禁无端在资产树重复打开新标签**。
+  - 先运行 `bctl subtabs` 查看已有终端标签，或直接使用 `bctl connect <IP>`。
+  - `bctl connect <IP>` 会优先检测并复用现有活跃终端标签；仅当标签不存在、或已断开连接（`Connection closed`）时才自动重连；如确需同时打开多个终端，显式传入 `--new`。
+  - 需要在已有终端间切换时，执行 `bctl switch <IP|标题|序号>` 瞬间无缝切换。
+- **Web 终端命令穿透**：
+  - 支持 JumpServer (Luna/Koko)、K8s 容器终端 (DOPS / Rancher / Kubernetes Dashboard)、基于 Xterm.js 的各类自研 Web 终端。
+  - 自动递归 iframe、穿透 Vue/React 虚拟 DOM 挂载的 `term` 实例；当 JavaScript 内存变量未暴露时，自动退化为极速聚焦 `.xterm-helper-textarea` + 拟真键入驱动，兼顾所有非标终端。
+  - 终端连接目标服务器后，直接调用 `bctl exec '<shell命令>'`。
 
 ### 3. Kibana DevTools 与代码编辑器查询 (`bctl devtools`)
 - 支持 Kibana DevTools、自研 ES 查询平台、Monaco Editor、Ace Editor 与 CodeMirror。

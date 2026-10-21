@@ -666,7 +666,27 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
     // D. 抓取页面活跃 Web 终端与 DevTools 控制台
     const hasXterm = document.querySelector(".xterm, .xterm-helper-textarea");
     if (hasXterm) {
-      lines.push("[就绪终端] Web 终端 (Xterm) 已激活，支持 `bctl exec '<cmd>'` 穿透执行");
+      let termSummary = "[就绪终端] Web 终端 (Xterm) 已就绪，支持 `bctl exec '<cmd>'` 穿透执行";
+      try {
+        // 尝试抓取当前活跃终端尾部两行输出感知连接健康
+        let rows = Array.from(document.querySelectorAll(".xterm-rows > div")).map(d => d.innerText.trim()).filter(Boolean);
+        if (rows.length === 0) {
+          // 尝试穿透可见 iframe
+          const iframes = Array.from(document.querySelectorAll("iframe")).filter(f => f.getBoundingClientRect().width > 0);
+          for (const f of iframes) {
+            try {
+              const irows = f.contentDocument ? Array.from(f.contentDocument.querySelectorAll(".xterm-rows > div")).map(d => d.innerText.trim()).filter(Boolean) : [];
+              if (irows.length > 0) { rows = irows; break; }
+            } catch(e) {}
+          }
+        }
+        if (rows.length > 0) {
+          const tail = rows.slice(-3).join(" | ");
+          const isClosed = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
+          termSummary += `\n[终端尾部快照] ${tail}${isClosed ? " ⚠️ (连接已断开，需重连)" : " (连接存活)"}`;
+        }
+      } catch(e) {}
+      lines.push(termSummary);
     }
     const hasMonaco = document.querySelector(".monaco-editor");
     if (hasMonaco) {
@@ -698,33 +718,136 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
     return `<${tag}${type}>`;
   }
 
-  // 扫描页面并感知可交互元素（静默感知，不再在页面上渲染打扰视觉的数字角标）
+  function getSemanticLabelAndState(el) {
+    let text = el.innerText || el.placeholder || el.value || el.getAttribute("aria-label") || el.title || "";
+    
+    // 如果自身文本为空，从子级寻找 title/aria-label/alt
+    if (!text.trim()) {
+      const sub = el.querySelector("[title], [aria-label], img[alt], svg[title], span, i");
+      if (sub) {
+        text = sub.getAttribute("title") || sub.getAttribute("aria-label") || sub.getAttribute("alt") || sub.innerText || "";
+      }
+    }
+    // 如果依然为空，从有意义的父级标签提取（例如 li.title, label.innerText）
+    if (!text.trim() && el.parentElement) {
+      const p = el.parentElement;
+      if (p.getAttribute("title")) {
+        text = p.getAttribute("title");
+      } else if (p.tagName === "LI" || p.tagName === "LABEL") {
+        text = p.innerText.replace("×", "").trim();
+      }
+    }
+
+    text = text.replace(/\s+/g, " ").trim().slice(0, 45);
+
+    // 状态感知
+    const states = [];
+    const cls = (el.className || "") + " " + (el.parentElement?.className || "");
+    if (/active|selected|current|is-active|is-selected/i.test(cls) || el.getAttribute("aria-selected") === "true") {
+      states.push("激活/选中");
+    }
+    if (el.disabled || /disabled|is-disabled/i.test(cls)) {
+      states.push("禁用");
+    }
+    if (el.checked || el.getAttribute("aria-checked") === "true") {
+      states.push("已勾选");
+    }
+    if (el.getAttribute("aria-expanded") === "true") {
+      states.push("已展开");
+    }
+    if (/close|cancel|关闭/i.test(el.className || "") || text === "×") {
+      states.push("关闭按钮");
+    }
+
+    const stateStr = states.length > 0 ? ` [${states.join(",")}]` : "";
+    return { text: text || "(无文本)", stateStr };
+  }
+
+  // 全网页通用多标签页 (Tabs) 结构感知
+  function extractPageTabs(elements) {
+    const tabCandidates = document.querySelectorAll(
+      '[role="tab"], .tab, .tabs li, elements-content-tab li, .el-tabs__item, .ant-tabs-tab, .nav-tabs li, .nav-tabs a, .sub-tab'
+    );
+    if (!tabCandidates || tabCandidates.length === 0) return null;
+
+    const validTabs = [];
+    for (const tab of tabCandidates) {
+      if (!isInViewport(tab) && tab.getBoundingClientRect().width === 0) continue;
+      let title = tab.getAttribute("title") || tab.innerText.replace("×", "").trim();
+      if (!title && tab.querySelector("[title]")) {
+        title = tab.querySelector("[title]").getAttribute("title");
+      }
+      if (!title || title.length > 60) continue;
+
+      const isActive = /active|selected|current|is-active/i.test(tab.className || "") || tab.getAttribute("aria-selected") === "true";
+      
+      let elIndex = elements.indexOf(tab);
+      if (elIndex === -1 && tab.querySelector("a, button, span")) {
+        elIndex = elements.indexOf(tab.querySelector("a, button, span"));
+      }
+
+      validTabs.push({
+        title,
+        active: isActive,
+        indexStr: elIndex >= 0 ? `[${elIndex}]` : "可点击"
+      });
+    }
+
+    if (validTabs.length <= 1) return null;
+
+    const lines = ["--- 页面内嵌标签页 (Tabs) ---"];
+    validTabs.forEach((t, i) => {
+      const actMark = t.active ? " [当前激活/选中]" : "";
+      lines.push(`• Tab ${i}: "${t.title}" ${t.indexStr}${actMark}`);
+    });
+    return lines.join("\n");
+  }
+
+  // 扫描页面并感知可交互元素（静默感知，高密度视觉语义视图）
   function scanElements() {
     document.querySelectorAll(".bctl-badge-overlay").forEach(b => b.remove());
-    const selector = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [onclick]';
-    const elements = Array.from(document.querySelectorAll(selector)).filter((el) => {
+    const selector = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [onclick], .tabs li, elements-content-tab li, .el-tabs__item, .ant-tabs-tab';
+    const rawElements = Array.from(document.querySelectorAll(selector)).filter((el) => {
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
       return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none" && isInViewport(el);
     });
 
+    // 弹窗感知：若存在顶层激活弹窗，优先将弹窗内元素前置
+    const activeModal = document.querySelector('mat-dialog-container, [role="dialog"], .modal.show, .modal.in, .ant-modal, .el-dialog');
+    let elements = rawElements;
+    let modalNotice = "";
+    if (activeModal && activeModal.getBoundingClientRect().width > 0) {
+      const modalText = activeModal.innerText.replace(/\s+/g, " ").trim().slice(0, 100);
+      modalNotice = `\n=== ⚠️ [顶层弹窗激活] ${modalText} ===\n(请优先处理弹窗内按钮或表单)`;
+      const insideModal = [];
+      const outsideModal = [];
+      for (const el of rawElements) {
+        if (activeModal.contains(el)) insideModal.push(el);
+        else outsideModal.push(el);
+      }
+      elements = [...insideModal, ...outsideModal];
+    }
+
     window._bctlElements = elements;
     const lines = [`当前页面: ${document.title} (${location.href})`];
+    if (modalNotice) lines.push(modalNotice);
+
+    // 优先注入通用多标签页概览
+    const tabSummary = extractPageTabs(elements);
+    if (tabSummary) lines.push(tabSummary);
 
     elements.slice(0, 100).forEach((el, i) => {
       const tag = el.tagName.toLowerCase();
       const type = el.getAttribute("type") ? `:${el.getAttribute("type")}` : "";
-      const label = (el.innerText || el.placeholder || el.value || el.getAttribute("aria-label") || el.title || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 40);
-      lines.push(`[${i}] <${tag}${type}> ${label}`);
+      const { text, stateStr } = getSemanticLabelAndState(el);
+      lines.push(`[${i}] <${tag}${type}> ${text}${stateStr}`);
     });
 
     const dataSummary = extractVisibleDashboardData();
     if (dataSummary) lines.push(dataSummary);
 
-    // 感知页面多级滚动容器（内外滚动条、弹窗、表格、代码块）
+    // 感知页面多级滚动容器
     const containers = collectScrollContainers();
     window._bctlScrollContainers = containers;
     const scrollableOnes = containers.filter(c => {

@@ -167,6 +167,9 @@ bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及
   bctl unbind / release    解除控制并释放绑定的标签页（立即平滑淡出胶囊并恢复原生 Tab 栏图标）
   bctl new <url>           在后台静默打开新标签页并自动绑定（人类前台零干扰）
   bctl open <url>          在当前绑定的标签页打开指定网址并返回元素列表
+  bctl subtabs / terms     查看当前页面内嵌的终端标签列表与连接状态 (JumpServer 等多标签终端)
+  bctl switch <IP|序号>    在当前页面一键切换到指定的内嵌终端标签页 (不重新打开)
+  bctl connect <IP> [--new] 智能连接主机 (优先复用已连接终端，断开自动重连，支持 --new 强制新开)
   bctl exec "<shell命令>"  在绑定的 Web 终端 (JumpServer / DOPS / K8s / Xterm) 中穿透执行命令并获取输出
   bctl devtools "<查询>"   在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器中填充并执行查询
   bctl probe               一键嗅探当前页面所有就绪终端、编辑器 (Monaco / Ace / CodeMirror) 与表单
@@ -221,6 +224,26 @@ if (cmd === "daemon") {
     process.exit(1);
   }
   const result = await sendCommand("bind", { target });
+  console.log(result);
+} else if (cmd === "subtabs" || cmd === "terms" || cmd === "term-tabs") {
+  const result = await sendCommand("term_tabs");
+  console.log(result);
+} else if (cmd === "switch" || cmd === "term-switch") {
+  const target = args[1];
+  if (!target) {
+    console.error("用法: bctl switch <终端序号、IP或主机名关键词>");
+    process.exit(1);
+  }
+  const result = await sendCommand("term_switch", { target });
+  console.log(result);
+} else if (cmd === "connect" || cmd === "jump") {
+  const target = args[1];
+  if (!target) {
+    console.error("用法: bctl connect <IP或主机名关键词> [--new]");
+    process.exit(1);
+  }
+  const forceNew = args.includes("--new") || args.includes("-f") || args.includes("--force-new");
+  const result = await sendCommand("term_connect", { target, forceNew, timeoutMs: 15000 });
   console.log(result);
 } else if (cmd === "exec" || cmd === "term-exec") {
   const commandToRun = args.slice(1).join(" ");

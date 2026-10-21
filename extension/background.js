@@ -325,6 +325,332 @@ async function connectWS() {
         return;
       }
 
+      // ─── 动作 4.7: 内嵌终端标签页列表 (bctl subtabs / bctl terms) ───
+      if (action === "term_tabs" || action === "subtabs") {
+        await ensureContentScript(targetTab.id);
+
+        // 探测所有 frame 内终端的真实健康状态 (从 buffer 判定断开)
+        const frameHealthResults = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, allFrames: true },
+          world: "MAIN",
+          func: () => {
+            const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
+            const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
+            if (!isTermFrame) return null;
+
+            const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
+            let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
+            if (!term) {
+              let el = allXtermEls[0];
+              while (el) {
+                if (isTerm(el._terminal)) { term = el._terminal; break; }
+                if (isTerm(el.term)) { term = el.term; break; }
+                el = el.parentElement;
+              }
+            }
+
+            let isDisconnected = false;
+            let tail = "";
+            if (term && term.buffer && term.buffer.active) {
+              const buf = term.buffer.active;
+              let lines = [];
+              for (let r = Math.max(0, buf.baseY + buf.cursorY - 4); r <= buf.baseY + buf.cursorY; r++) {
+                const line = buf.getLine(r);
+                if (line) lines.push(line.translateToString(true));
+              }
+              tail = lines.join("\n");
+              isDisconnected = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
+            }
+            return { href: location.href, isDisconnected, tail };
+          }
+        });
+
+        const healthMap = new Map();
+        for (const item of (frameHealthResults || [])) {
+          if (item?.result?.href) {
+            healthMap.set(item.result.href, item.result.isDisconnected);
+          }
+        }
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          world: "MAIN",
+          func: () => {
+            const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+            const windows = Array.from(document.querySelectorAll(".window"));
+            if (lunaTabs.length === 0) {
+              const hasTerm = !!document.querySelector(".xterm, .xterm-helper-textarea");
+              return {
+                type: hasTerm ? "single" : "none",
+                tabs: hasTerm ? [{ idx: 0, title: document.title || "Web Terminal", active: true, status: "connected" }] : []
+              };
+            }
+            const list = lunaTabs.map((li, idx) => {
+              const title = li.getAttribute("title") || li.innerText.replace("×", "").trim();
+              const active = li.classList.contains("active");
+              const win = windows[idx];
+              const iframe = win?.querySelector("iframe");
+              const src = iframe?.src || "";
+              return { idx, id: li.id, title, active, src };
+            });
+            return { type: "jumpserver", tabs: list };
+          }
+        });
+
+        const report = results?.[0]?.result;
+        if (!report || report.tabs.length === 0) {
+          ws.send(JSON.stringify({ id, result: "当前页面未检测到支持的 Web 终端标签页" }));
+          return;
+        }
+
+        const lines = report.tabs.map(t => {
+          const isDisconnected = healthMap.get(t.src) === true;
+          const activeTag = t.active ? " [当前激活]" : "";
+          const statusTag = isDisconnected ? " (连接已断开: Connection closed)" : " (已连接)";
+          return `[${t.idx}] ${t.title}${activeTag}${statusTag}`;
+        });
+
+        const header = `Web 终端标签页 (共 ${report.tabs.length} 个):`;
+        ws.send(JSON.stringify({ id, result: `${header}\n${lines.join("\n")}\n\n* 可使用 \`bctl switch <IP|标题|序号>\` 快速切换终端\n* 可使用 \`bctl connect <IP>\` 智能按需连接 (优先复用已连接标签)` }));
+        return;
+      }
+
+      // ─── 动作 4.8: 内嵌终端标签页切换 (bctl switch <目标>) ───
+      if (action === "term_switch" || action === "subswitch") {
+        const target = payload.target || "";
+        await ensureContentScript(targetTab.id);
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          world: "MAIN",
+          args: [target],
+          func: (query) => {
+            const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+            if (lunaTabs.length === 0) return { ok: false, error: "当前页面未检测到支持切换的多终端标签栏" };
+
+            let matchIndex = -1;
+            const q = String(query).toLowerCase().trim();
+            if (/^\d+$/.test(q)) {
+              matchIndex = parseInt(q, 10);
+            } else {
+              matchIndex = lunaTabs.findIndex(li => {
+                const title = (li.getAttribute("title") || li.innerText || "").toLowerCase();
+                return title.includes(q);
+              });
+            }
+
+            if (matchIndex < 0 || matchIndex >= lunaTabs.length) {
+              const titles = lunaTabs.map((li, i) => `[${i}] ${li.getAttribute("title") || li.innerText.replace("×", "").trim()}`).join("\n");
+              return { ok: false, error: `未找到匹配 "${query}" 的终端标签！当前可用终端：\n${titles}` };
+            }
+
+            const targetLi = lunaTabs[matchIndex];
+            const title = targetLi.getAttribute("title") || targetLi.innerText.replace("×", "").trim();
+            const clickEl = targetLi.querySelector("span") || targetLi;
+            clickEl.click();
+
+            return { ok: true, idx: matchIndex, title };
+          }
+        });
+
+        const r = results?.[0]?.result;
+        if (!r?.ok) {
+          ws.send(JSON.stringify({ id, result: `[切换失败] ${r?.error || "未知错误"}` }));
+        } else {
+          ws.send(JSON.stringify({ id, result: `已成功切换到终端标签页 [${r.idx}] "${r.title}"` }));
+        }
+        return;
+      }
+
+      // ─── 动作 4.9: 智能按需连接 (bctl connect <IP|主机名> [--new]) ───
+      if (action === "term_connect" || action === "jump") {
+        const target = payload.target || "";
+        const forceNew = !!payload.forceNew;
+        await ensureContentScript(targetTab.id);
+
+        // 1. 探测各 frame 真实连接状态与已有终端标签
+        const frameHealthResults = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, allFrames: true },
+          world: "MAIN",
+          func: () => {
+            const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
+            const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
+            if (!isTermFrame) return null;
+
+            const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
+            let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
+            if (!term) {
+              let el = allXtermEls[0];
+              while (el) {
+                if (isTerm(el._terminal)) { term = el._terminal; break; }
+                if (isTerm(el.term)) { term = el.term; break; }
+                el = el.parentElement;
+              }
+            }
+
+            let isDisconnected = false;
+            if (term && term.buffer && term.buffer.active) {
+              const buf = term.buffer.active;
+              let lines = [];
+              for (let r = Math.max(0, buf.baseY + buf.cursorY - 4); r <= buf.baseY + buf.cursorY; r++) {
+                const line = buf.getLine(r);
+                if (line) lines.push(line.translateToString(true));
+              }
+              const tail = lines.join("\n");
+              isDisconnected = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
+            }
+            return { href: location.href, isDisconnected };
+          }
+        });
+
+        const healthMap = new Map();
+        for (const item of (frameHealthResults || [])) {
+          if (item?.result?.href) {
+            healthMap.set(item.result.href, item.result.isDisconnected);
+          }
+        }
+
+        const checkRes = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          world: "MAIN",
+          func: () => {
+            const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+            const windows = Array.from(document.querySelectorAll(".window"));
+            return lunaTabs.map((li, idx) => {
+              const title = li.getAttribute("title") || li.innerText.replace("×", "").trim();
+              const active = li.classList.contains("active");
+              const win = windows[idx];
+              const iframe = win?.querySelector("iframe");
+              const src = iframe?.src || "";
+              return { idx, id: li.id, title, active, src };
+            });
+          }
+        });
+
+        const existingTabs = (checkRes?.[0]?.result || []).map(t => ({
+          ...t,
+          status: healthMap.get(t.src) === true ? "disconnected" : "connected"
+        }));
+        const q = String(target).toLowerCase().trim();
+        const matched = existingTabs.find(t => t.title.toLowerCase().includes(q));
+
+        // 如果找到已有标签
+        if (matched && !forceNew) {
+          if (matched.status !== "disconnected") {
+            // 连接存活：直接切换复用！
+            await chrome.scripting.executeScript({
+              target: { tabId: targetTab.id },
+              world: "MAIN",
+              args: [matched.idx],
+              func: (idx) => {
+                const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+                const targetLi = lunaTabs[idx];
+                if (targetLi && !targetLi.classList.contains("active")) {
+                  (targetLi.querySelector("span") || targetLi).click();
+                }
+              }
+            });
+            ws.send(JSON.stringify({
+              id,
+              result: `[复用现有终端] 发现已连接的终端标签页 [${matched.idx}] "${matched.title}"，已直接切换复用（未新开）！`
+            }));
+            return;
+          } else {
+            // 已断开连接：关闭旧标签，继续新建
+            await chrome.scripting.executeScript({
+              target: { tabId: targetTab.id },
+              world: "MAIN",
+              args: [matched.id],
+              func: (id) => {
+                const oldTab = document.getElementById(id);
+                oldTab?.querySelector(".close")?.click();
+              }
+            });
+            await new Promise(r => setTimeout(r, 600));
+          }
+        }
+
+        // 2. 在 JumpServer 资产树中搜索并新建连接
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: `正在连接主机: ${target}...` }
+        }).catch(() => {});
+
+        const createRes = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          world: "MAIN",
+          args: [target],
+          func: async (keyword) => {
+            const searchInput = document.querySelector("#assetsSearchInput, .tree-input");
+            if (!searchInput) return { ok: false, error: "未在当前页面找到 JumpServer 资产搜索框 (#assetsSearchInput)" };
+
+            searchInput.value = keyword;
+            searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+            searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+            searchInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, bubbles: true }));
+
+            // 等待搜索结果出现
+            const startTime = Date.now();
+            let matchedNode = null;
+            while (Date.now() - startTime < 3500) {
+              const nodes = Array.from(document.querySelectorAll("#assetsTree a, .ztree a"));
+              matchedNode = nodes.find(a => a.getBoundingClientRect().width > 0 && a.innerText && a.innerText.toLowerCase().includes(keyword.toLowerCase()));
+              if (matchedNode) break;
+              await new Promise(r => setTimeout(r, 200));
+            }
+
+            if (!matchedNode) {
+              return { ok: false, error: `在 JumpServer 资产树中未找到匹配 "${keyword}" 的主机节点` };
+            }
+
+            // 点击节点触发连接
+            matchedNode.click();
+
+            // 监听并自动点击确认弹窗 (mat-dialog / modal)
+            const modalStartTime = Date.now();
+            while (Date.now() - modalStartTime < 2500) {
+              const dialog = document.querySelector("mat-dialog-container, .modal, .dialog");
+              if (dialog) {
+                const btns = Array.from(dialog.querySelectorAll("button"));
+                const confirmBtn = btns.find(b => b.innerText && (b.innerText.includes("确认") || b.innerText.includes("确定") || b.innerText.includes("OK")));
+                if (confirmBtn) {
+                  const rect = confirmBtn.getBoundingClientRect();
+                  const x = rect.left + rect.width / 2;
+                  const y = rect.top + rect.height / 2;
+                  const topEl = document.elementFromPoint(x, y) || confirmBtn.querySelector("span") || confirmBtn;
+                  ["mousedown", "mouseup", "click"].forEach(type => {
+                    topEl.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+                  });
+                  confirmBtn.click();
+                  break;
+                }
+              }
+              const activeTab = document.querySelector(".tabs li.active");
+              if (activeTab && activeTab.innerText.toLowerCase().includes(keyword.toLowerCase())) break;
+              await new Promise(r => setTimeout(r, 200));
+            }
+
+            // 等待新标签页渲染
+            await new Promise(r => setTimeout(r, 1500));
+            const finalTab = document.querySelector(".tabs li.active");
+            const title = finalTab ? (finalTab.getAttribute("title") || finalTab.innerText.replace("×", "").trim()) : keyword;
+            return { ok: true, title };
+          }
+        });
+
+        const r = createRes?.[0]?.result;
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: "终端就绪", autoResetDelay: 2500 }
+        }).catch(() => {});
+
+        if (!r?.ok) {
+          ws.send(JSON.stringify({ id, result: `[连接失败] ${r?.error || "未知异常"}` }));
+        } else {
+          ws.send(JSON.stringify({ id, result: `[新开终端就绪] 已在 JumpServer 连接并切换至终端标签页: "${r.title}"` }));
+        }
+        return;
+      }
+
       // ─── 动作 5: 常规 look / act（穿透至 content.js） ───
       await ensureContentScript(targetTab.id);
       const res = await chrome.tabs.sendMessage(targetTab.id, { action, payload });
@@ -412,6 +738,12 @@ function waitForTabLoad(tabId) {
 
 // ─── MAIN 世界通用 Web 终端 (Xterm / JumpServer / DOPS / K8s) 注入函数 ───
 async function executeInWebTerminal(cmd, timeoutMs) {
+  try {
+    if (window.frameElement && window.frameElement.getBoundingClientRect().width === 0) {
+      return { matched: false };
+    }
+  } catch (e) {}
+
   const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
   const isTermFrame = location.pathname.includes("/koko/") || location.pathname.includes("/luna/") || allXtermEls.length > 0 || window.term || window.terminal;
   if (!isTermFrame) return { matched: false };
@@ -899,12 +1231,20 @@ function probePageInteractiveCapabilities() {
     inputsCount: document.querySelectorAll("input:not([type='hidden']), textarea, [contenteditable='true']").length
   };
 
+  const isFrameVisible = (() => {
+    try {
+      return window.frameElement ? window.frameElement.getBoundingClientRect().width > 0 : true;
+    } catch (e) {
+      return true;
+    }
+  })();
+
   const xtermEls = document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]");
   if (xtermEls.length > 0 || window.term || window.terminal) {
     result.terminals.push({
       type: "Xterm / Web Terminal",
       count: xtermEls.length,
-      visible: Array.from(xtermEls).some(el => el.offsetParent !== null),
+      visible: isFrameVisible && Array.from(xtermEls).some(el => el.offsetParent !== null),
       instruction: "可用 `bctl exec '<cmd>'` 穿透执行命令"
     });
   }
