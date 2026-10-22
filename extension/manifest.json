@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ghost Cursor Browser Bridge Pro",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "description": "为本地 AI Agent 提供日常 Chrome 控制、JumpServer 终端直连、后台无干扰并发与 ChatGPT 官方原生弹簧物理贝塞尔光标",
   "permissions": [
     "activeTab",
