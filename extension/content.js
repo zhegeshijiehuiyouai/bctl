@@ -341,11 +341,36 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
     }
   }
 
-  // ─── 5. React / Vue 受控输入框原生穿透 ───
+  // ─── 5. React / Vue 受控输入框与终端隐藏输入陷阱原生穿透 ───
   async function humanType(el, text) {
     el.focus();
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+
+    // 特判 1: 零宽字符哨兵输入框 (如 Guacamole / 华为云堡垒机 v-guacTextInput)
+    // 严禁清空其中的 \u200b (否则会被误判为连续按 Backspace)，也不能逐字覆盖累加
+    if (typeof el.value === "string" && (el.value.includes("\u200b") || el.id === "inputArea")) {
+      const zwsp = "\u200b\u200b\u200b\u200b";
+      const payload = `${zwsp}${text}${zwsp}`;
+      if (nativeSetter) nativeSetter.call(el, payload);
+      else el.value = payload;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+
+    // 特判 2: Web 终端隐藏输入陷阱 (如 .xterm-helper-textarea 或标记为 bctlTermTrap 的输入框)
+    if (el.classList?.contains("xterm-helper-textarea") || el.dataset?.bctlTermTrap === "true") {
+      let sent = false;
+      try {
+        sent = document.execCommand("insertText", false, text);
+      } catch (_) {}
+      if (!sent) {
+        if (nativeSetter) nativeSetter.call(el, text);
+        else el.value = text;
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+      }
+      return;
+    }
 
     if (nativeSetter) nativeSetter.call(el, "");
     else el.value = "";
@@ -366,6 +391,15 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
   async function moveToElement(el) {
     let rect = el.getBoundingClientRect();
+    // 若目标是位于视口外的终端隐藏输入陷阱 (如 left: -582px 的 #inputArea)，将光标移向可视终端画布中心而非屏幕外
+    if (rect.right <= 0 || rect.bottom <= 0 || rect.left < 0 || el.dataset?.bctlTermTrap === "true") {
+      const surface = document.querySelector("#yabProxyGuac, .xterm, canvas, .display") || document.body;
+      const sRect = surface.getBoundingClientRect();
+      const targetX = Math.round(Math.max(40, Math.min(window.innerWidth - 40, sRect.left + sRect.width / 2)));
+      const targetY = Math.round(Math.max(40, Math.min(window.innerHeight - 40, sRect.top + sRect.height / 2)));
+      await springMoveTo(targetX, targetY);
+      return { targetX, targetY };
+    }
     if (rect.top < 20 || rect.bottom > window.innerHeight - 20 || rect.left < 10 || rect.right > window.innerWidth - 10) {
       el.scrollIntoView({ behavior: document.hidden ? "instant" : "smooth", block: "center", inline: "nearest" });
       await new Promise((r) => setTimeout(r, document.hidden ? 50 : 350));
@@ -665,6 +699,7 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
     // D. 抓取页面活跃 Web 终端与 DevTools 控制台
     const hasXterm = document.querySelector(".xterm, .xterm-helper-textarea");
+    const hasGuac = document.querySelector("#yabProxyGuac, #inputArea.target, .guac-keyboard");
     if (hasXterm) {
       let termSummary = "[就绪终端] Web 终端 (Xterm) 已就绪，支持 `bctl exec '<cmd>'` 穿透执行";
       try {
@@ -687,6 +722,8 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
         }
       } catch(e) {}
       lines.push(termSummary);
+    } else if (hasGuac) {
+      lines.push("[就绪终端] 云堡垒机 / Guacamole (Canvas 终端) 已就绪，支持直接调用 `bctl exec '<cmd>'` 穿透执行命令并自动回传屏幕输出");
     }
     const hasMonaco = document.querySelector(".monaco-editor");
     if (hasMonaco) {
@@ -813,6 +850,27 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none" && isInViewport(el);
     });
 
+    // 启发式发现视口外/透明的 Web 终端隐藏输入陷阱 (如 #inputArea.target, .xterm-helper-textarea 等)，破除 isInViewport 盲区
+    const hiddenTermTraps = Array.from(document.querySelectorAll("textarea, input:not([type='hidden']):not([type='checkbox']):not([type='radio'])"))
+      .filter(el => {
+        if (rawElements.includes(el)) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const val = el.value || "";
+        const idCls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""} ${el.parentElement?.className || ""}`;
+        return (
+          val.includes("\u200b") ||
+          el.id === "inputArea" ||
+          /xterm-helper-textarea|guac|term|tty|ssh|shell|console/i.test(idCls) ||
+          (el === document.activeElement && el.tagName === "TEXTAREA")
+        );
+      });
+
+    for (const trap of hiddenTermTraps) {
+      trap.dataset.bctlTermTrap = "true";
+      rawElements.push(trap);
+    }
+
     // 弹窗感知：若存在顶层激活弹窗，优先将弹窗内元素前置
     const activeModal = document.querySelector('mat-dialog-container, [role="dialog"], .modal.show, .modal.in, .ant-modal, .el-dialog');
     let elements = rawElements;
@@ -840,6 +898,13 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
     elements.slice(0, 100).forEach((el, i) => {
       const tag = el.tagName.toLowerCase();
       const type = el.getAttribute("type") ? `:${el.getAttribute("type")}` : "";
+      if (el.dataset?.bctlTermTrap === "true") {
+        const idAttr = el.id ? `#${el.id}` : "";
+        const clsAttr = typeof el.className === "string" && el.className.trim() ? `.${el.className.trim().split(/\s+/)[0]}` : "";
+        const focusTag = el === document.activeElement ? " [当前焦点]" : "";
+        lines.push(`[${i}] <${tag}${idAttr}${clsAttr}> [Web终端隐藏命令输入口 - 推荐直接用 bctl exec '<cmd>' 或对此编号执行 type/press]${focusTag}`);
+        return;
+      }
       const { text, stateStr } = getSemanticLabelAndState(el);
       lines.push(`[${i}] <${tag}${type}> ${text}${stateStr}`);
     });
@@ -965,10 +1030,18 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
             } else if (type === "press") {
               const k = key || "Enter";
               if (!act.desc && !act.status) setAgentStatus(`正在按键: ${k}`);
-              const active = document.activeElement || document.body;
-              active.dispatchEvent(new KeyboardEvent("keydown", { key: k, code: k, bubbles: true }));
-              active.dispatchEvent(new KeyboardEvent("keyup", { key: k, code: k, bubbles: true }));
-              if (k === "Enter" && active.form) active.form.requestSubmit?.();
+              const active = document.activeElement || document.querySelector("#inputArea") || document.body;
+              if (k === "Enter" && active && typeof active.value === "string" && (active.value.includes("\u200b") || active.id === "inputArea")) {
+                const zwsp = "\u200b\u200b\u200b\u200b";
+                active.value = `${zwsp}\n${zwsp}`;
+                active.dispatchEvent(new Event("input", { bubbles: true }));
+              } else {
+                const keyCode = k === "Enter" ? 13 : (k === "Tab" ? 9 : (k === "Escape" ? 27 : (k === "Backspace" ? 8 : 0)));
+                active.dispatchEvent(new KeyboardEvent("keydown", { key: k, code: k, keyCode, which: keyCode, bubbles: true }));
+                active.dispatchEvent(new KeyboardEvent("keypress", { key: k, code: k, keyCode, which: keyCode, charCode: keyCode, bubbles: true }));
+                active.dispatchEvent(new KeyboardEvent("keyup", { key: k, code: k, keyCode, which: keyCode, bubbles: true }));
+                if (k === "Enter" && active.form) active.form.requestSubmit?.();
+              }
               logs.push(`按键 ${k}`);
             } else if (type === "scroll") {
               let dy = 500;

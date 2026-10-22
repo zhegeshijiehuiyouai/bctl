@@ -66,8 +66,12 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
   - `bctl connect <IP>` 会优先检测并复用现有活跃终端标签；仅当标签不存在、或已断开连接（`Connection closed`）时才自动重连；如确需同时打开多个终端，显式传入 `--new`。
   - 需要在已有终端间切换时，执行 `bctl switch <IP|标题|序号>` 瞬间无缝切换。
 - **Web 终端命令穿透**：
-  - 支持 JumpServer (Luna/Koko)、K8s 容器终端 (DOPS / Rancher / Kubernetes Dashboard)、基于 Xterm.js 的各类自研 Web 终端。
-  - 自动递归 iframe、穿透 Vue/React 虚拟 DOM 挂载的 `term` 实例；当 JavaScript 内存变量未暴露时，自动退化为极速聚焦 `.xterm-helper-textarea` + 拟真键入驱动，兼顾所有非标终端。
+  - 支持 JumpServer (Luna/Koko)、华为云堡垒机/齐治/云匣子 (Apache Guacamole Canvas + X11 Keysym)、K8s 容器终端 (DOPS / Rancher / Kubernetes Dashboard)、基于 Xterm.js 的各类自研 Web 终端，以及非标自研 WebShell。
+  - **四级自适应探测与通用输入兜底架构**：
+    1. **Level 1 (协议/实例直连)**：自动递归穿透 iframe、Vue/React 实例提取 `term` (Xterm.js) 或 `Guacamole.Client` (云堡垒机 Canvas + X11 Keysym + 静默剪贴板流屏幕读取)；
+    2. **Level 2 (隐藏输入陷阱启发式嗅探)**：针对各类非标终端将 `<textarea>` 藏于视口外（如 `left: -582px` 的 `#inputArea.target`）或透明层的物理共性，突破视口限制扫描零宽字符哨兵（`\u200b`）、`autocorrect="off"`、`document.activeElement` 等特征，自动定位隐藏输入口；
+    3. **Level 3 (主动点击唤醒 + 多模派发)**：若未直接命中，自动模拟点击主画布中心唤醒隐藏输入框焦点，并根据目标特征自适应切换零宽字符注入、`execCommand("insertText")` 或 Canvas 逐字符物理键盘事件流；
+    4. **Level 4 (`bctl look` / `bctl act` 可视化兜底)**：`bctl look` 会将探测到的视口外隐藏终端输入口显式暴露在编号列表中（标注 `[Web终端隐藏命令输入口]`），即使不走 `bctl exec`，也可直接对该编号执行 `bctl act` 的 `type` / `press` 下发命令。
   - 终端连接目标服务器后，直接调用 `bctl exec '<shell命令>'`。
 
 ### 3. Kibana DevTools 与代码编辑器查询 (`bctl devtools`)

@@ -346,9 +346,9 @@ async function connectWS() {
           target: { tabId: targetTab.id },
           world: "MAIN",
           args: [payload.code],
-          func: (code) => {
+          func: async (code) => {
             try {
-              const res = (0, eval)(code);
+              const res = await (0, eval)(code);
               return typeof res === "object" ? JSON.stringify(res, null, 2) : String(res);
             } catch (e) {
               return "[Eval Error] " + e.message;
@@ -368,7 +368,8 @@ async function connectWS() {
           target: { tabId: targetTab.id, allFrames: true },
           world: "MAIN",
           func: () => {
-            const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
+            const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"))
+              .filter(el => !(el instanceof SVGElement));
             const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
             if (!isTermFrame) return null;
 
@@ -410,10 +411,31 @@ async function connectWS() {
           target: { tabId: targetTab.id },
           world: "MAIN",
           func: () => {
+            // 1. 华为云堡垒机 / 云匣子 (yabProxyGuac) 多会话列表感知
+            const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
+            if (yabRoot && Array.isArray(yabRoot.batchLoginConnectData) && yabRoot.batchLoginConnectData.length > 0) {
+              const curId = yabRoot.connectDetailData?.id;
+              const list = yabRoot.batchLoginConnectData.map((item, idx) => {
+                const baseGuac = typeof yabRoot.getBaseGuac === "function" ? yabRoot.getBaseGuac(item) : null;
+                const connState = baseGuac?.managedClient?.clientState?.connectionState;
+                const isDisc = connState && connState !== "CONNECTED" && connState !== "WAITING" && connState !== "CONNECTING";
+                return {
+                  idx,
+                  id: item.id,
+                  title: `${item.name || "Host"} (${item.accountName ? item.accountName + "@" : ""}${item.address || ""})`,
+                  active: item.id === curId,
+                  src: item.id,
+                  disconnected: Boolean(isDisc)
+                };
+              });
+              return { type: "yab_guac", tabs: list };
+            }
+
+            // 2. JumpServer Luna 多标签感知
             const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
             const windows = Array.from(document.querySelectorAll(".window"));
             if (lunaTabs.length === 0) {
-              const hasTerm = !!document.querySelector(".xterm, .xterm-helper-textarea");
+              const hasTerm = !!document.querySelector(".xterm, .xterm-helper-textarea, #yabProxyGuac, #inputArea.target");
               return {
                 type: hasTerm ? "single" : "none",
                 tabs: hasTerm ? [{ idx: 0, title: document.title || "Web Terminal", active: true, status: "connected" }] : []
@@ -438,7 +460,7 @@ async function connectWS() {
         }
 
         const lines = report.tabs.map(t => {
-          const isDisconnected = healthMap.get(t.src) === true;
+          const isDisconnected = t.disconnected === true || healthMap.get(t.src) === true;
           const activeTag = t.active ? " [当前激活]" : "";
           const statusTag = isDisconnected ? " (连接已断开: Connection closed)" : " (已连接)";
           return `[${t.idx}] ${t.title}${activeTag}${statusTag}`;
@@ -458,11 +480,35 @@ async function connectWS() {
           world: "MAIN",
           args: [target],
           func: (query) => {
+            const q = String(query).toLowerCase().trim();
+
+            // 1. 华为云堡垒机 / 云匣子多会话切换
+            const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
+            if (yabRoot && Array.isArray(yabRoot.batchLoginConnectData) && yabRoot.batchLoginConnectData.length > 0) {
+              const list = yabRoot.batchLoginConnectData;
+              let matchIndex = -1;
+              if (/^\d+$/.test(q)) {
+                matchIndex = parseInt(q, 10);
+              } else {
+                matchIndex = list.findIndex(item =>
+                  (item.name || "").toLowerCase().includes(q) ||
+                  (item.address || "").toLowerCase().includes(q)
+                );
+              }
+              if (matchIndex < 0 || matchIndex >= list.length) {
+                const titles = list.map((item, i) => `[${i}] ${item.name} (${item.address})`).join("\n");
+                return { ok: false, error: `未找到匹配 "${query}" 的终端标签！当前可用终端：\n${titles}` };
+              }
+              const targetItem = list[matchIndex];
+              yabRoot.$store?.commit("SET_H5_CONNECT_DETAIL", targetItem);
+              return { ok: true, idx: matchIndex, title: `${targetItem.name} (${targetItem.address})` };
+            }
+
+            // 2. JumpServer Luna 多标签切换
             const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
             if (lunaTabs.length === 0) return { ok: false, error: "当前页面未检测到支持切换的多终端标签栏" };
 
             let matchIndex = -1;
-            const q = String(query).toLowerCase().trim();
             if (/^\d+$/.test(q)) {
               matchIndex = parseInt(q, 10);
             } else {
@@ -773,7 +819,7 @@ function waitForTabLoad(tabId) {
   });
 }
 
-// ─── MAIN 世界通用 Web 终端 (Xterm / JumpServer / DOPS / K8s) 注入函数 ───
+// ─── MAIN 世界通用 Web 终端 (Xterm / Guacamole / 云堡垒机 / JumpServer / DOPS / K8s / 任意自研终端) 注入函数 ───
 async function executeInWebTerminal(cmd, timeoutMs) {
   try {
     if (window.frameElement && window.frameElement.getBoundingClientRect().width === 0) {
@@ -781,16 +827,72 @@ async function executeInWebTerminal(cmd, timeoutMs) {
     }
   } catch (e) {}
 
-  const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
-  const isTermFrame = location.pathname.includes("/koko/") || location.pathname.includes("/luna/") || allXtermEls.length > 0 || window.term || window.terminal;
-  if (!isTermFrame) return { matched: false };
+  const cleanCmd = cmd.replace(/[\r\n]+$/, "");
+  const cmdLines = cleanCmd.split(/\r?\n/);
+  const firstCmdLine = (cmdLines[0] || "").trim();
+  const rawInput = `${cleanCmd}\r`;
 
+  function isInteractivePrompt(trimmed) {
+    if (!trimmed) return false;
+    if (/(?:password|passphrase)(?:\s+for\s+[^\s:]+)?\s*:\s*$/i.test(trimmed)) return true;
+    if (/密码\s*[：:]\s*$/.test(trimmed)) return true;
+    if (/\((?:yes\/no(?:\/\[fingerprint\])?|y\/n)\)\??\s*:?\s*$/i.test(trimmed)) return true;
+    return false;
+  }
+
+  function isShellPrompt(trimmed, initPrompt) {
+    if (!trimmed) return false;
+    if (initPrompt && trimmed === initPrompt) return true;
+    if (/^(?:\([^)]+\)\s*)*\[[^\]]+@[^\]]+\]\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/^(?:\([^)]+\)\s*)*[^\s@]+@[^\s:]+:[^\s]*\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/^(?:sh|bash|zsh|csh|ksh|dash|ash)(?:-[\d.]+)?\s*[#$%>]\s*$/.test(trimmed)) return true;
+    if (/[#$%>]\s*$/.test(trimmed) && !trimmed.endsWith("==")) return true;
+    if (/^(?:mysql|redis[^›>]*|postgres[^›>]*|sqlite3?)\s*>\s*$/i.test(trimmed)) return true;
+    if (isInteractivePrompt(trimmed)) return true;
+    return false;
+  }
+
+  // 辅助：基于执行前尾部锚点 (anchorLines) 在最新屏幕行中定位本次命令回显行索引
+  function findNewCommandEchoIdx(beforeLines, currentLines) {
+    let searchFrom = 0;
+    const anchorEnd = Math.max(0, beforeLines.length - 1);
+    const anchorStart = Math.max(0, anchorEnd - 3);
+    const anchors = beforeLines.slice(anchorStart, anchorEnd);
+
+    if (anchors.length > 0) {
+      for (let i = Math.min(currentLines.length - 1, beforeLines.length + 10); i >= anchors.length - 1; i--) {
+        let match = true;
+        for (let k = 0; k < anchors.length; k++) {
+          if (currentLines[i - anchors.length + 1 + k] !== anchors[k]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          searchFrom = i + 1;
+          break;
+        }
+      }
+    }
+
+    if (!firstCmdLine) return searchFrom;
+    for (let i = currentLines.length - 2; i >= searchFrom; i--) {
+      if (currentLines[i].includes(firstCmdLine)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // 1. 过滤掉 <symbol id="icon-yab_h_terminal"> 等 SVG 图标元素，避免假阳性
+  const allXtermEls = Array.from(
+    document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]")
+  ).filter(el => !(el instanceof SVGElement));
   const xtermEl = allXtermEls.find(el => el.offsetParent !== null) || allXtermEls[0];
-  if (!xtermEl && !window.term && !window.terminal) return { matched: false };
 
   function findXtermInstance(startEl) {
     const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
-    
+
     // 0. 全局 window 探测
     if (isTerm(window.term)) return window.term;
     if (isTerm(window.terminal)) return window.terminal;
@@ -868,32 +970,9 @@ async function executeInWebTerminal(cmd, timeoutMs) {
     return null;
   }
 
-  const cleanCmd = cmd.replace(/[\r\n]+$/, "");
-  const cmdLines = cleanCmd.split(/\r?\n/);
-  const rawInput = `${cleanCmd}\r`;
-
-  function isInteractivePrompt(trimmed) {
-    if (!trimmed) return false;
-    if (/(?:password|passphrase)(?:\s+for\s+[^\s:]+)?\s*:\s*$/i.test(trimmed)) return true;
-    if (/\((?:yes\/no(?:\/\[fingerprint\])?|y\/n)\)\??\s*:?\s*$/i.test(trimmed)) return true;
-    return false;
-  }
-
-  function isShellPrompt(trimmed, initPrompt) {
-    if (!trimmed) return false;
-    if (initPrompt && trimmed === initPrompt) return true;
-    if (/^(?:\([^)]+\)\s*)*\[[^\]]+@[^\]]+\]\s*[#$%>]\s*$/.test(trimmed)) return true;
-    if (/^(?:\([^)]+\)\s*)*[^\s@]+@[^\s:]+:[^\s]*\s*[#$%>]\s*$/.test(trimmed)) return true;
-    if (/^(?:sh|bash|zsh|csh|ksh|dash|ash)(?:-[\d.]+)?\s*[#$%>]\s*$/.test(trimmed)) return true;
-    if (/[#$%>]\s*$/.test(trimmed) && !trimmed.endsWith("==")) return true;
-    if (/^(?:mysql|redis[^›>]*|postgres[^›>]*|sqlite3?)\s*>\s*$/i.test(trimmed)) return true;
-    if (isInteractivePrompt(trimmed)) return true;
-    return false;
-  }
-
   const term = findXtermInstance(xtermEl);
 
-  // ─── 分支 A: 找到 term 实例，走高精度 Buffer 解析模式 ───
+  // ─── 分支 A (Level 1A): 找到 Xterm.js 内存实例，走高精度 Buffer 解析模式 ───
   if (term) {
     function extractLogicalLines(buffer, fromRow, toRow) {
       const maxIdx = Math.min(buffer.length - 1, toRow);
@@ -1048,29 +1127,449 @@ async function executeInWebTerminal(cmd, timeoutMs) {
     });
   }
 
-  // ─── 分支 B: 未暴露 term 实例时，走通用 DOM 模拟降级模式 ───
-  const helper = document.querySelector(".xterm-helper-textarea");
-  if (!helper) return { matched: false };
+  // ─── 分支 B (Level 1B): Apache Guacamole / 华为云堡垒机 (yabProxyGuac) Canvas 协议穿透 ───
+  function findGuacContext() {
+    const isGuacClient = (obj) =>
+      obj &&
+      typeof obj === "object" &&
+      typeof obj.sendKeyEvent === "function" &&
+      typeof obj.sendMouseState === "function" &&
+      typeof obj.getDisplay === "function";
 
-  return new Promise((resolve) => {
-    function getScreenLines() {
-      return Array.from(document.querySelectorAll(".xterm-rows > div"))
-        .map(d => d.innerText.replace(/\u00a0/g, " ").trim())
-        .filter(Boolean);
+    // 1. 华为云堡垒机 / 云匣子 (.yab-proxy-root)
+    const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
+    if (yabRoot && typeof yabRoot.getCurrentBaseGuac === "function") {
+      const baseGuac = yabRoot.getCurrentBaseGuac();
+      const client = baseGuac?.client || baseGuac?.managedClient?.client;
+      if (isGuacClient(client)) {
+        return {
+          rootVue: yabRoot,
+          baseGuac,
+          client,
+          managedClient: baseGuac.managedClient || null,
+          display: baseGuac.display || client.getDisplay()
+        };
+      }
     }
 
-    const beforeLines = getScreenLines();
-    const initialPrompt = (beforeLines[beforeLines.length - 1] || "").trim();
+    // 2. 通用 Guacamole 实例扫描 (遍历 DOM Vue/React 与 window)
+    const allEls = document.querySelectorAll("#connect, [class*='guac' i], [id*='guac' i], .display");
+    for (const el of allEls) {
+      const v = el.__vue__;
+      if (v) {
+        const c = v.client || v.managedClient?.client || v.guacClient;
+        if (isGuacClient(c)) {
+          return {
+            rootVue: v.$root || v,
+            baseGuac: v,
+            client: c,
+            managedClient: v.managedClient || null,
+            display: v.display || c.getDisplay()
+          };
+        }
+      }
+    }
 
-    helper.focus();
-    let sent = false;
-    try {
-      sent = document.execCommand("insertText", false, rawInput);
-    } catch (_) {}
-    if (!sent) {
-      helper.value = rawInput;
-      helper.dispatchEvent(new InputEvent("input", { bubbles: true, data: rawInput, inputType: "insertText" }));
-      helper.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+    for (const k of Object.keys(window)) {
+      try {
+        const val = window[k];
+        if (isGuacClient(val)) {
+          return { rootVue: null, baseGuac: null, client: val, managedClient: null, display: val.getDisplay() };
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  const guacCtx = findGuacContext();
+  if (guacCtx) {
+    const { rootVue, client, managedClient, display } = guacCtx;
+    const connState = managedClient?.clientState?.connectionState;
+    if (connState && ["DISCONNECTED", "CLIENT_ERROR", "TUNNEL_ERROR", "FORCE_CLOSE"].includes(connState)) {
+      return {
+        matched: true,
+        ok: false,
+        error: `当前 Guacamole/云堡垒机终端连接已断开 (${connState})，请点击重连后再执行命令`,
+        partialOutput: ""
+      };
+    }
+
+    // 通过静默全屏划选 + 拦截 onclipboard 流读取 Guacamole 服务端终端缓冲文本
+    async function readGuacScreenLines() {
+      const w = typeof display?.getWidth === "function" ? display.getWidth() : 0;
+      const h = typeof display?.getHeight === "function" ? display.getHeight() : 0;
+      if (w <= 0 || h <= 0) return [];
+
+      const origShowToast = rootVue ? rootVue.showToast : null;
+      if (rootVue) rootVue.showToast = function () {};
+
+      const origOnClipboard = client.onclipboard;
+      let resolved = false;
+
+      return new Promise((resolve) => {
+        const finish = (rawText) => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timer);
+          client.onclipboard = origOnClipboard;
+          if (rootVue && origShowToast) {
+            setTimeout(() => {
+              rootVue.showToast = origShowToast;
+            }, 60);
+          }
+          const lines = String(rawText || "")
+            .split(/\r?\n/)
+            .map(l => l.replace(/\u00a0/g, " ").trimEnd())
+            .filter(l => l.trim().length > 0);
+          resolve(lines);
+        };
+
+        const timer = setTimeout(() => {
+          finish(managedClient ? managedClient.clipboardData : "");
+        }, 420);
+
+        client.onclipboard = function (stream, mimetype) {
+          if (origOnClipboard) {
+            try { origOnClipboard.call(this, stream, mimetype); } catch (_) {}
+          }
+          if (mimetype === "text/plain" && stream) {
+            let customBuf = "";
+            const prevOnBlob = stream.onblob;
+            const prevOnEnd = stream.onend;
+            stream.onblob = function (b64) {
+              if (prevOnBlob) {
+                prevOnBlob.apply(this, arguments);
+              } else {
+                try {
+                  const bin = atob(b64);
+                  const bytes = new Uint8Array(bin.length);
+                  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                  customBuf += new TextDecoder("utf-8").decode(bytes, { stream: true });
+                  stream.sendAck?.("Received", 0);
+                } catch (_) {}
+              }
+            };
+            stream.onend = function () {
+              if (prevOnEnd) prevOnEnd.apply(this, arguments);
+              const text = (managedClient && managedClient.clipboardData) ? managedClient.clipboardData : customBuf;
+              finish(text);
+            };
+          }
+        };
+
+        // 避开右侧 64px 宽的 Canvas 滚动条，划选终端字符区域触发 guacd 剪贴板流下发
+        const endX = Math.max(20, w - 80);
+        const endY = Math.max(20, h - 10);
+        client.sendMouseState({ x: 5, y: 5, left: false, middle: false, right: false, up: false, down: false, dblclick: false });
+        client.sendMouseState({ x: 5, y: 5, left: true, middle: false, right: false, up: false, down: false, dblclick: false });
+        client.sendMouseState({ x: Math.floor(endX / 2), y: Math.floor(endY / 2), left: true, middle: false, right: false, up: false, down: false, dblclick: false });
+        client.sendMouseState({ x: endX, y: endY, left: true, middle: false, right: false, up: false, down: false, dblclick: false });
+        client.sendMouseState({ x: endX, y: endY, left: false, middle: false, right: false, up: false, down: false, dblclick: false });
+        if (typeof client.yabCleanLayerMouseChoose === "function") {
+          client.yabCleanLayerMouseChoose(managedClient?.protocol || 1);
+        }
+      });
+    }
+
+    function sendGuacCommand(text) {
+      const toKeysym = (cp) => {
+        if (cp === 10 || cp === 13) return 65293; // X11 Return (0xFF0D)
+        if (cp <= 31 || (cp >= 127 && cp <= 159)) return 65280 | cp;
+        if (cp >= 0 && cp <= 255) return cp;
+        if (cp >= 256 && cp <= 1114111) return 16777216 | cp;
+        return null;
+      };
+      for (const ch of text) {
+        const ks = toKeysym(ch.codePointAt(0));
+        if (ks !== null) {
+          client.sendKeyEvent(1, ks);
+          client.sendKeyEvent(0, ks);
+        }
+      }
+      client.sendKeyEvent(1, 65293);
+      client.sendKeyEvent(0, 65293);
+    }
+
+    const beforeLines = await readGuacScreenLines();
+    const beforeSnapshot = beforeLines.join("\n");
+    const initialPrompt = (beforeLines[beforeLines.length - 1] || "").trim();
+    const wasInteractive = isInteractivePrompt(initialPrompt);
+
+    sendGuacCommand(cleanCmd);
+
+    return new Promise((resolve) => {
+      let finished = false;
+      let polling = false;
+      let stableMatchCount = 0;
+      let lastMatchedSnapshot = "";
+
+      const timeoutTimer = setTimeout(async () => {
+        if (finished) return;
+        finished = true;
+        clearInterval(pollTimer);
+        const afterLines = await readGuacScreenLines();
+        resolve({
+          matched: true,
+          ok: false,
+          error: `指令在 ${timeoutMs}ms 内未执行完（可能卡在交互式输入或耗时命令）`,
+          partialOutput: afterLines.slice(-20).join("\n")
+        });
+      }, timeoutMs);
+
+      const pollTimer = setInterval(async () => {
+        if (finished || polling) return;
+        polling = true;
+        try {
+          const currentLines = await readGuacScreenLines();
+          if (currentLines.length === 0) return;
+
+          const currentSnapshot = currentLines.join("\n");
+          if (currentSnapshot === beforeSnapshot) return;
+
+          const lastLine = (currentLines[currentLines.length - 1] || "").trim();
+          const echoIdx = findNewCommandEchoIdx(beforeLines, currentLines);
+
+          // 确认命令已回显（或此前处于 Password: 等无回显交互态）且最后一行已回到提示符
+          const echoReady = wasInteractive || (echoIdx >= 0 && echoIdx < currentLines.length - 1);
+          if (echoReady && isShellPrompt(lastLine, initialPrompt)) {
+            if (currentSnapshot === lastMatchedSnapshot) {
+              stableMatchCount++;
+            } else {
+              stableMatchCount = 1;
+              lastMatchedSnapshot = currentSnapshot;
+            }
+
+            if (stableMatchCount >= 1) {
+              // 再做一次短延时复核确保输出流稳定
+              await new Promise(r => setTimeout(r, 160));
+              const finalLines = await readGuacScreenLines();
+              const finalLast = (finalLines[finalLines.length - 1] || "").trim();
+              if (!isShellPrompt(finalLast, initialPrompt)) {
+                stableMatchCount = 0;
+                return;
+              }
+
+              finished = true;
+              clearInterval(pollTimer);
+              clearTimeout(timeoutTimer);
+
+              const finalEchoIdx = findNewCommandEchoIdx(beforeLines, finalLines);
+              const outStart = finalEchoIdx >= 0
+                ? finalEchoIdx + cmdLines.length
+                : Math.max(0, beforeLines.length);
+              const outEnd = isInteractivePrompt(finalLast)
+                ? finalLines.length
+                : Math.max(outStart, finalLines.length - 1);
+              const output = finalLines.slice(outStart, outEnd).map(l => l.trimEnd()).join("\n").trim();
+
+              resolve({
+                matched: true,
+                ok: true,
+                exitCode: 0,
+                output
+              });
+            }
+          } else {
+            stableMatchCount = 0;
+          }
+        } finally {
+          polling = false;
+        }
+      }, 220);
+    });
+  }
+
+  // ─── 分支 C (Level 2 & 3): 启发式通用终端输入陷阱嗅探 + 点击唤醒 + 多模自适应派发兜底 ───
+  // 专为世间千奇百态的非标 Web 终端设计：不依赖固定 class，通过物理特征定位输入口
+  function discoverUniversalTerminalTarget() {
+    // 1. 寻找可视终端渲染画布/容器（用于判断是否终端页及点击唤醒焦点）
+    const surfaceCandidates = Array.from(
+      document.querySelectorAll("canvas, .xterm, .xterm-screen, pre, [class*='term' i], [id*='term' i], [class*='guac' i], [id*='guac' i], [class*='console' i], [class*='shell' i], [class*='ssh' i], [class*='tty' i]")
+    ).filter(el => {
+      if (el instanceof SVGElement) return false;
+      const r = el.getBoundingClientRect();
+      return r.width >= 160 && r.height >= 100;
+    });
+    surfaceCandidates.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (rb.width * rb.height) - (ra.width * ra.height);
+    });
+    const primarySurface = surfaceCandidates[0] || null;
+
+    // 2. 扫描全文档所有潜在文本接收控件（突破视口限制！专门纳入 left<0 或 opacity:0 的隐藏输入陷阱）
+    function scoreInputTrap(el) {
+      if (!el || el.disabled || el.readOnly) return -1;
+      const tag = el.tagName;
+      if (tag === "INPUT") {
+        const type = (el.getAttribute("type") || "text").toLowerCase();
+        if (["checkbox", "radio", "button", "submit", "reset", "file", "hidden", "range", "color", "image"].includes(type)) {
+          return -1;
+        }
+      } else if (tag !== "TEXTAREA" && el.getAttribute("contenteditable") !== "true") {
+        return -1;
+      }
+
+      let score = 0;
+      const val = el.value || "";
+      const idCls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""} ${el.parentElement?.className || ""} ${el.parentElement?.parentElement?.className || ""}`;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+
+      if (style.display === "none" || style.visibility === "hidden") return -1;
+
+      // 特征 1: 包含零宽空格 \u200b (Guacamole / 远程终端经典光标陷阱特征)
+      if (val.includes("\u200b")) score += 65;
+
+      // 特征 2: 经典终端类名/ID 命中
+      if (/xterm-helper-textarea|inputArea|guac|term|tty|ssh|shell|console|cmd|clipboard|ime/i.test(idCls)) {
+        score += 40;
+      }
+
+      // 特征 3: 当前正持有浏览器焦点 (Web 终端初始化后常驻锁定焦点)
+      if (el === document.activeElement) score += 35;
+
+      // 特征 4: 禁用自动纠错/首字母大写 (所有 Web 终端隐藏输入框标配)
+      if (el.getAttribute("autocorrect") === "off" || el.getAttribute("autocapitalize") === "off" || el.getAttribute("spellcheck") === "false") {
+        score += 25;
+      }
+
+      // 特征 5: 位于视口外 (left<0 / top<0) 或全透明/极小尺寸的 TEXTAREA (专用于拦截键盘与输入法事件的 Input Trap)
+      const isOffscreenOrHiddenTrap = rect.right <= 0 || rect.bottom <= 0 || rect.left < -10 || parseFloat(style.opacity) === 0 || (rect.width <= 4 && rect.height <= 4);
+      if (tag === "TEXTAREA" && isOffscreenOrHiddenTrap) {
+        score += 30;
+      }
+
+      return score;
+    }
+
+    const allInputs = Array.from(document.querySelectorAll("textarea, input, [contenteditable='true']"));
+    let scored = allInputs.map(el => ({ el, score: scoreInputTrap(el) })).filter(x => x.score > 0);
+    scored.sort((a, b) => b.score - a.score);
+
+    if (scored.length > 0 && scored[0].score >= 35) {
+      return { inputEl: scored[0].el, surfaceEl: primarySurface, score: scored[0].score, method: "heuristic-trap" };
+    }
+
+    // 3. 主动点击唤醒探测 (Click-to-Wake Focus Probing)：
+    // 若未直接找到高置信度输入框，模拟点击主终端画布中心，诱发终端组件自动 focus 其隐藏输入框
+    if (primarySurface) {
+      const r = primarySurface.getBoundingClientRect();
+      const cx = Math.round(r.left + r.width / 2);
+      const cy = Math.round(r.top + r.height / 2);
+      const hitEl = document.elementFromPoint(cx, cy) || primarySurface;
+      ["mousedown", "mouseup", "click"].forEach(type => {
+        hitEl.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window }));
+      });
+
+      const active = document.activeElement;
+      if (active && active !== document.body && active !== document.documentElement) {
+        const s = scoreInputTrap(active);
+        if (s >= 0) {
+          return { inputEl: active, surfaceEl: primarySurface, score: s + 40, method: "click-woken-activeElement" };
+        }
+      }
+
+      // 退化为直接向画布/当前焦点派发物理键盘事件流
+      return { inputEl: primarySurface, surfaceEl: primarySurface, score: 20, method: "surface-keyevent-stream" };
+    }
+
+    return null;
+  }
+
+  const universalTarget = discoverUniversalTerminalTarget();
+  if (!universalTarget) return { matched: false };
+
+  function dispatchUniversalTerminalInput(targetEl, commandText) {
+    const val = targetEl.value || "";
+
+    // 模式 1: 零宽字符哨兵输入框 (如 Guacamole v-guacTextInput)
+    if (typeof targetEl.value === "string" && val.includes("\u200b")) {
+      targetEl.focus();
+      const zwsp = "\u200b\u200b\u200b\u200b";
+      targetEl.value = `${zwsp}${commandText}\n${zwsp}`;
+      targetEl.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+
+    // 模式 2: 隐藏或标准 Textarea / Input
+    if (targetEl.tagName === "TEXTAREA" || targetEl.tagName === "INPUT") {
+      targetEl.focus();
+      let sent = false;
+      try {
+        sent = document.execCommand("insertText", false, `${commandText}\r`);
+      } catch (_) {}
+      if (!sent) {
+        targetEl.value = `${commandText}\r`;
+        targetEl.dispatchEvent(new InputEvent("input", { bubbles: true, data: `${commandText}\r`, inputType: "insertText" }));
+        targetEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+        targetEl.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13, bubbles: true }));
+        targetEl.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      }
+      return;
+    }
+
+    // 模式 3: Canvas / 容器逐字符物理键盘事件流兜底
+    if (targetEl.tabIndex < 0) targetEl.tabIndex = 0;
+    targetEl.focus();
+    const targets = [targetEl, document.activeElement, document, window].filter(Boolean);
+    for (const ch of commandText) {
+      const code = ch.charCodeAt(0);
+      for (const t of targets) {
+        t.dispatchEvent?.(new KeyboardEvent("keydown", { key: ch, keyCode: code, which: code, bubbles: true, cancelable: true }));
+        t.dispatchEvent?.(new KeyboardEvent("keypress", { key: ch, keyCode: code, which: code, charCode: code, bubbles: true, cancelable: true }));
+        t.dispatchEvent?.(new KeyboardEvent("keyup", { key: ch, keyCode: code, which: code, bubbles: true, cancelable: true }));
+      }
+    }
+    for (const t of targets) {
+      t.dispatchEvent?.(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+      t.dispatchEvent?.(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13, bubbles: true, cancelable: true }));
+      t.dispatchEvent?.(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    }
+  }
+
+  function getScreenLines() {
+    // 1. 标准 Xterm DOM 行
+    const xtermRows = Array.from(document.querySelectorAll(".xterm-rows > div"))
+      .map(d => d.innerText.replace(/\u00a0/g, " ").trim())
+      .filter(Boolean);
+    if (xtermRows.length > 0) return xtermRows;
+
+    // 2. 通用 DOM 终端容器行 (pre, .terminal-output, [class*="term"] 等)
+    const domContainers = Array.from(
+      document.querySelectorAll(".terminal-output, .terminal-content, pre, [class*='terminal' i], [class*='console' i]")
+    ).filter(el => !(el instanceof SVGElement) && el.offsetParent !== null && (el.innerText || "").trim().length > 0);
+
+    if (domContainers.length > 0) {
+      const best = domContainers.sort((a, b) => (b.innerText || "").length - (a.innerText || "").length)[0];
+      return (best.innerText || "")
+        .split(/\r?\n/)
+        .map(l => l.replace(/\u00a0/g, " ").trim())
+        .filter(Boolean);
+    }
+    return [];
+  }
+
+  return new Promise((resolve) => {
+    const beforeLines = getScreenLines();
+    const beforeSnapshot = beforeLines.join("\n");
+    const initialPrompt = (beforeLines[beforeLines.length - 1] || "").trim();
+    const wasInteractive = isInteractivePrompt(initialPrompt);
+
+    dispatchUniversalTerminalInput(universalTarget.inputEl, cleanCmd);
+
+    // 若页面为纯 Canvas 且无 DOM 文本行，等待短暂执行后返回明确状态
+    if (beforeLines.length === 0) {
+      setTimeout(() => {
+        const afterLines = getScreenLines();
+        if (afterLines.length === 0) {
+          resolve({
+            matched: true,
+            ok: true,
+            output: `[已通过通用终端通道 (${universalTarget.method}: <${universalTarget.inputEl.tagName.toLowerCase()}${universalTarget.inputEl.id ? "#" + universalTarget.inputEl.id : ""}>) 下发命令: ${cleanCmd}] (当前终端采用纯画布渲染无 DOM 文本节点)`
+          });
+        }
+      }, 600);
     }
 
     let settleTimer = null;
@@ -1093,21 +1592,21 @@ async function executeInWebTerminal(cmd, timeoutMs) {
       if (finished) return;
       const currentLines = getScreenLines();
       if (currentLines.length === 0) return;
+      if (currentLines.join("\n") === beforeSnapshot) return;
+
       const lastLine = currentLines[currentLines.length - 1] || "";
-      if (isShellPrompt(lastLine, initialPrompt)) {
+      const echoIdx = findNewCommandEchoIdx(beforeLines, currentLines);
+      const echoReady = wasInteractive || (echoIdx >= 0 && echoIdx < currentLines.length - 1);
+
+      if (echoReady && isShellPrompt(lastLine, initialPrompt)) {
         if (!settleTimer) {
           settleTimer = setTimeout(() => {
             finished = true;
             clearInterval(pollInterval);
             clearTimeout(timeoutTimer);
             const finalLines = getScreenLines();
-            let startIdx = 0;
-            for (let i = 0; i < finalLines.length; i++) {
-              if (finalLines[i].includes(cleanCmd)) {
-                startIdx = i + 1;
-                break;
-              }
-            }
+            const finalEchoIdx = findNewCommandEchoIdx(beforeLines, finalLines);
+            const startIdx = finalEchoIdx >= 0 ? finalEchoIdx + cmdLines.length : Math.max(0, beforeLines.length);
             const outLines = finalLines.slice(startIdx, Math.max(startIdx, finalLines.length - 1));
             resolve({
               matched: true,
@@ -1276,14 +1775,80 @@ function probePageInteractiveCapabilities() {
     }
   })();
 
-  const xtermEls = document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]");
+  // 1. Xterm 探测 (过滤 SVG <symbol> 假阳性)
+  const xtermEls = Array.from(
+    document.querySelectorAll(".xterm, .xterm-helper-textarea, .xterm-screen")
+  ).filter(el => !(el instanceof SVGElement));
   if (xtermEls.length > 0 || window.term || window.terminal) {
     result.terminals.push({
-      type: "Xterm / Web Terminal",
+      type: "Xterm.js Web Terminal",
       count: xtermEls.length,
-      visible: isFrameVisible && Array.from(xtermEls).some(el => el.offsetParent !== null),
+      visible: isFrameVisible && xtermEls.some(el => el.offsetParent !== null),
       instruction: "可用 `bctl exec '<cmd>'` 穿透执行命令"
     });
+  }
+
+  // 2. Apache Guacamole / 华为云堡垒机 (yabProxyGuac) 探测
+  const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
+  const baseGuac = yabRoot && typeof yabRoot.getCurrentBaseGuac === "function" ? yabRoot.getCurrentBaseGuac() : null;
+  const guacClient = baseGuac?.client || baseGuac?.managedClient?.client;
+  if (guacClient && typeof guacClient.sendKeyEvent === "function") {
+    const mc = baseGuac.managedClient;
+    const disp = baseGuac.display || guacClient.getDisplay?.();
+    result.terminals.push({
+      type: "Apache Guacamole / 云堡垒机 (Canvas + X11 Keysym)",
+      host: mc?.connectData ? `${mc.connectData.accountName || ""}@${mc.connectData.address || ""} (${mc.connectData.name || ""})` : document.title,
+      connectionState: mc?.clientState?.connectionState || "CONNECTED",
+      canvasSize: disp ? `${disp.getWidth()}x${disp.getHeight()}` : "unknown",
+      inputTrapSelector: "#inputArea.target",
+      visible: isFrameVisible,
+      instruction: "可用 `bctl exec '<cmd>'` 穿透执行命令（自动通过 X11 Keysym 输入并经剪贴板流读取回显）"
+    });
+  }
+
+  // 3. 通用隐藏输入陷阱 (Universal Terminal Input Trap) 启发式探测兜底
+  const trapCandidates = Array.from(document.querySelectorAll("textarea, input:not([type='hidden']):not([type='checkbox']):not([type='radio']), [contenteditable='true']"))
+    .map(el => {
+      const val = el.value || "";
+      const rect = el.getBoundingClientRect();
+      const idCls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""} ${el.parentElement?.className || ""}`;
+      let score = 0;
+      if (val.includes("\u200b")) score += 65;
+      if (/xterm-helper-textarea|inputArea|guac|term|tty|ssh|shell|console|cmd|clipboard|ime/i.test(idCls)) score += 40;
+      if (el === document.activeElement) score += 35;
+      if (el.getAttribute("autocorrect") === "off" || el.getAttribute("autocapitalize") === "off") score += 25;
+      if (el.tagName === "TEXTAREA" && (rect.right <= 0 || rect.bottom <= 0 || rect.left < -10)) score += 30;
+      return {
+        el,
+        score,
+        selector: `${el.tagName.toLowerCase()}${el.id ? "#" + el.id : ""}${typeof el.className === "string" && el.className.trim() ? "." + el.className.trim().split(/\s+/).join(".") : ""}`,
+        isFocused: el === document.activeElement,
+        isOffscreen: rect.right <= 0 || rect.bottom <= 0 || rect.left < 0,
+        hasZeroWidthTrap: val.includes("\u200b")
+      };
+    })
+    .filter(x => x.score >= 40)
+    .sort((a, b) => b.score - a.score);
+
+  if (trapCandidates.length > 0 && result.terminals.length === 0) {
+    const top = trapCandidates[0];
+    result.terminals.push({
+      type: "Universal Web Terminal (启发式捕获隐藏输入陷阱)",
+      inputSelector: top.selector,
+      focused: top.isFocused,
+      offscreenTrap: top.isOffscreen,
+      zeroWidthMode: top.hasZeroWidthTrap,
+      score: top.score,
+      visible: isFrameVisible,
+      instruction: "可用 `bctl exec '<cmd>'` 执行命令，或在 `bctl look` 中对该终端输入口执行 `bctl act` type 操作"
+    });
+  } else if (trapCandidates.length > 0 && result.terminals.length > 0) {
+    result.terminals[0].discoveredInputTrap = {
+      selector: trapCandidates[0].selector,
+      focused: trapCandidates[0].isFocused,
+      offscreenTrap: trapCandidates[0].isOffscreen,
+      zeroWidthMode: trapCandidates[0].hasZeroWidthTrap
+    };
   }
 
   if (window.monaco?.editor?.getEditors()?.length > 0 || document.querySelector(".monaco-editor")) {
