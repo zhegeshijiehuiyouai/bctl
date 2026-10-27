@@ -360,6 +360,19 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
 
     // 特判 2: Web 终端隐藏输入陷阱 (如 .xterm-helper-textarea 或标记为 bctlTermTrap 的输入框)
     if (el.classList?.contains("xterm-helper-textarea") || el.dataset?.bctlTermTrap === "true") {
+      el.dispatchEvent(new Event("focus"));
+      el.dispatchEvent(new KeyboardEvent("keyup", { key: "Shift", code: "ShiftLeft", keyCode: 16, which: 16, bubbles: true }));
+      const inputEvt = new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        composed: false,
+        data: text,
+        inputType: "insertText"
+      });
+      el.dispatchEvent(inputEvt);
+      if (inputEvt.defaultPrevented || el.classList?.contains("xterm-helper-textarea")) {
+        return;
+      }
       let sent = false;
       try {
         sent = document.execCommand("insertText", false, text);
@@ -392,8 +405,9 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
   async function moveToElement(el) {
     let rect = el.getBoundingClientRect();
     // 若目标是位于视口外的终端隐藏输入陷阱 (如 left: -582px 的 #inputArea)，将光标移向可视终端画布中心而非屏幕外
-    if (rect.right <= 0 || rect.bottom <= 0 || rect.left < 0 || el.dataset?.bctlTermTrap === "true") {
-      const surface = document.querySelector("#yabProxyGuac, .xterm, canvas, .display") || document.body;
+    if (rect.right <= 0 || rect.bottom <= 0 || rect.left < 0 || el.dataset?.bctlTermTrap === "true" || el.ownerDocument !== document) {
+      const ownerFrame = el.ownerDocument !== document ? el.ownerDocument?.defaultView?.frameElement : null;
+      const surface = ownerFrame || document.querySelector("#yabProxyGuac, .xterm, canvas, .display, .window.active iframe, iframe") || document.body;
       const sRect = surface.getBoundingClientRect();
       const targetX = Math.round(Math.max(40, Math.min(window.innerWidth - 40, sRect.left + sRect.width / 2)));
       const targetY = Math.round(Math.max(40, Math.min(window.innerHeight - 40, sRect.top + sRect.height / 2)));
@@ -698,7 +712,18 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
     }
 
     // D. 抓取页面活跃 Web 终端与 DevTools 控制台
-    const hasXterm = document.querySelector(".xterm, .xterm-helper-textarea");
+    const visibleIframes = Array.from(document.querySelectorAll("iframe")).filter(f => f.getBoundingClientRect().width > 0);
+    let hasXterm = !!document.querySelector(".xterm, .xterm-helper-textarea");
+    if (!hasXterm) {
+      for (const f of visibleIframes) {
+        try {
+          if (f.contentDocument?.querySelector(".xterm, .xterm-helper-textarea")) {
+            hasXterm = true;
+            break;
+          }
+        } catch (e) {}
+      }
+    }
     const hasGuac = document.querySelector("#yabProxyGuac, #inputArea.target, .guac-keyboard");
     if (hasXterm) {
       let termSummary = "[就绪终端] Web 终端 (Xterm) 已就绪，支持 `bctl exec '<cmd>'` 穿透执行";
@@ -707,8 +732,7 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
         let rows = Array.from(document.querySelectorAll(".xterm-rows > div")).map(d => d.innerText.trim()).filter(Boolean);
         if (rows.length === 0) {
           // 尝试穿透可见 iframe
-          const iframes = Array.from(document.querySelectorAll("iframe")).filter(f => f.getBoundingClientRect().width > 0);
-          for (const f of iframes) {
+          for (const f of visibleIframes) {
             try {
               const irows = f.contentDocument ? Array.from(f.contentDocument.querySelectorAll(".xterm-rows > div")).map(d => d.innerText.trim()).filter(Boolean) : [];
               if (irows.length > 0) { rows = irows; break; }
@@ -850,21 +874,38 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
       return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none" && isInViewport(el);
     });
 
-    // 启发式发现视口外/透明的 Web 终端隐藏输入陷阱 (如 #inputArea.target, .xterm-helper-textarea 等)，破除 isInViewport 盲区
-    const hiddenTermTraps = Array.from(document.querySelectorAll("textarea, input:not([type='hidden']):not([type='checkbox']):not([type='radio'])"))
-      .filter(el => {
-        if (rawElements.includes(el)) return false;
-        const style = window.getComputedStyle(el);
-        if (style.display === "none" || style.visibility === "hidden") return false;
-        const val = el.value || "";
-        const idCls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""} ${el.parentElement?.className || ""}`;
-        return (
-          val.includes("\u200b") ||
-          el.id === "inputArea" ||
-          /xterm-helper-textarea|guac|term|tty|ssh|shell|console/i.test(idCls) ||
-          (el === document.activeElement && el.tagName === "TEXTAREA")
-        );
-      });
+    // 启发式发现视口外/透明或同源 iframe 内的 Web 终端隐藏输入陷阱 (如 #inputArea.target, .xterm-helper-textarea 等)，破除 isInViewport 与 iframe 盲区
+    const termTrapRegex = /(?:xterm-helper-textarea|inputArea|guac|xterm|terminal|webterm|(?:^|[^a-z])(?:term|tty|ssh|shell|console)(?:$|[^a-z]))/i;
+    const candidateDocs = [document];
+    for (const ifr of Array.from(document.querySelectorAll("iframe"))) {
+      try {
+        const r = ifr.getBoundingClientRect();
+        if (r.width >= 160 && r.height >= 100 && ifr.contentDocument) {
+          candidateDocs.push(ifr.contentDocument);
+        }
+      } catch (_) {}
+    }
+
+    const hiddenTermTraps = [];
+    for (const doc of candidateDocs) {
+      const traps = Array.from(doc.querySelectorAll("textarea, input:not([type='hidden']):not([type='checkbox']):not([type='radio'])"))
+        .filter(el => {
+          if (rawElements.includes(el)) return false;
+          const win = el.ownerDocument?.defaultView || window;
+          const style = win.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return false;
+          const val = el.value || "";
+          const idCls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""} ${el.parentElement?.className || ""}`;
+          if (/watermark/i.test(idCls)) return false;
+          return (
+            val.includes("\u200b") ||
+            el.id === "inputArea" ||
+            termTrapRegex.test(idCls) ||
+            (el === doc.activeElement && el.tagName === "TEXTAREA")
+          );
+        });
+      hiddenTermTraps.push(...traps);
+    }
 
     for (const trap of hiddenTermTraps) {
       trap.dataset.bctlTermTrap = "true";
@@ -997,10 +1038,29 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
                 targetEl.focus();
               }
               playRipple(targetX, targetY);
-              const clickTarget = document.elementFromPoint(targetX, targetY) || (id !== undefined ? window._bctlElements?.[id] : null);
+              let clickTarget = document.elementFromPoint(targetX, targetY) || (id !== undefined ? window._bctlElements?.[id] : null);
+              let clickX = targetX;
+              let clickY = targetY;
+              if (clickTarget && clickTarget.tagName === "IFRAME") {
+                try {
+                  const iDoc = clickTarget.contentDocument;
+                  if (iDoc) {
+                    const iRect = clickTarget.getBoundingClientRect();
+                    clickX = targetX - iRect.left;
+                    clickY = targetY - iRect.top;
+                    clickTarget.focus();
+                    clickTarget = iDoc.elementFromPoint(clickX, clickY) || iDoc.body || clickTarget;
+                    const innerTermTa = iDoc.querySelector(".xterm-helper-textarea, #inputArea.target");
+                    if (innerTermTa) {
+                      innerTermTa.focus();
+                      innerTermTa.dispatchEvent(new Event("focus"));
+                    }
+                  }
+                } catch (_) {}
+              }
               if (clickTarget) {
-                clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: targetX, clientY: targetY }));
-                clickTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: targetX, clientY: targetY }));
+                clickTarget.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: clickX, clientY: clickY }));
+                clickTarget.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: clickX, clientY: clickY }));
                 clickTarget.click?.();
               }
               logs.push(`点击 ${id !== undefined ? `[${id}]` : `(${targetX}, ${targetY})`}`);
@@ -1030,11 +1090,24 @@ var se=24,X=se/2,Pt=23,Lt=24,Bt=12,Ut=-2.5,Ft=44,ae="--browser-agent-cursor-glow
             } else if (type === "press") {
               const k = key || "Enter";
               if (!act.desc && !act.status) setAgentStatus(`正在按键: ${k}`);
-              const active = document.activeElement || document.querySelector("#inputArea") || document.body;
+              let active = document.activeElement || document.querySelector("#inputArea") || document.body;
+              if (active && active.tagName === "IFRAME") {
+                try {
+                  const iDoc = active.contentDocument;
+                  if (iDoc) {
+                    active = iDoc.activeElement && iDoc.activeElement !== iDoc.body
+                      ? iDoc.activeElement
+                      : (iDoc.querySelector(".xterm-helper-textarea, #inputArea.target") || iDoc.body);
+                  }
+                } catch (_) {}
+              }
               if (k === "Enter" && active && typeof active.value === "string" && (active.value.includes("\u200b") || active.id === "inputArea")) {
                 const zwsp = "\u200b\u200b\u200b\u200b";
                 active.value = `${zwsp}\n${zwsp}`;
                 active.dispatchEvent(new Event("input", { bubbles: true }));
+              } else if (k === "Enter" && active && active.classList?.contains("xterm-helper-textarea")) {
+                active.dispatchEvent(new KeyboardEvent("keyup", { key: "Shift", code: "ShiftLeft", keyCode: 16, which: 16, bubbles: true }));
+                active.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, composed: false, data: "\r", inputType: "insertText" }));
               } else {
                 const keyCode = k === "Enter" ? 13 : (k === "Tab" ? 9 : (k === "Escape" ? 27 : (k === "Backspace" ? 8 : 0)));
                 active.dispatchEvent(new KeyboardEvent("keydown", { key: k, code: k, keyCode, which: keyCode, bubbles: true }));

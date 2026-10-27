@@ -222,7 +222,11 @@ async function connectWS() {
           func: executeInWebTerminal
         });
 
-        const hit = results?.find(r => r?.result && r.result.matched === true);
+        const hits = (results || [])
+          .map(r => r?.result)
+          .filter(r => r && r.matched === true)
+          .sort((a, b) => (a.tier || 99) - (b.tier || 99));
+        const hit = hits.length > 0 ? { result: hits[0] } : null;
         if (!hit) {
           chrome.tabs.sendMessage(targetTab.id, {
             action: "set_status",
@@ -373,7 +377,16 @@ async function connectWS() {
             const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
             if (!isTermFrame) return null;
 
-            const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
+            const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
+            const pickTerm = (obj) => {
+              if (!obj || typeof obj !== "object") return null;
+              if (isTerm(obj)) return obj;
+              if (isTerm(obj.terminal)) return obj.terminal;
+              if (isTerm(obj.term)) return obj.term;
+              if (isTerm(obj.value)) return obj.value;
+              if (isTerm(obj._value)) return obj._value;
+              return null;
+            };
             let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
             if (!term) {
               let el = allXtermEls[0];
@@ -382,6 +395,21 @@ async function connectWS() {
                 if (isTerm(el.term)) { term = el.term; break; }
                 el = el.parentElement;
               }
+            }
+            if (!term) {
+              try {
+                const pinia = document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$pinia;
+                const state = pinia?.state?.value;
+                if (state) {
+                  term = pickTerm(state.connection?.terminal) || pickTerm(state.connection);
+                  if (!term) {
+                    const map = state.tree?.terminalMap;
+                    if (map && typeof map.forEach === "function") {
+                      map.forEach((entry) => { if (!term) term = pickTerm(entry); });
+                    }
+                  }
+                }
+              } catch (_) {}
             }
 
             let isDisconnected = false;
@@ -556,7 +584,16 @@ async function connectWS() {
             const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
             if (!isTermFrame) return null;
 
-            const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
+            const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
+            const pickTerm = (obj) => {
+              if (!obj || typeof obj !== "object") return null;
+              if (isTerm(obj)) return obj;
+              if (isTerm(obj.terminal)) return obj.terminal;
+              if (isTerm(obj.term)) return obj.term;
+              if (isTerm(obj.value)) return obj.value;
+              if (isTerm(obj._value)) return obj._value;
+              return null;
+            };
             let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
             if (!term) {
               let el = allXtermEls[0];
@@ -565,6 +602,21 @@ async function connectWS() {
                 if (isTerm(el.term)) { term = el.term; break; }
                 el = el.parentElement;
               }
+            }
+            if (!term) {
+              try {
+                const pinia = document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$pinia;
+                const state = pinia?.state?.value;
+                if (state) {
+                  term = pickTerm(state.connection?.terminal) || pickTerm(state.connection);
+                  if (!term) {
+                    const map = state.tree?.terminalMap;
+                    if (map && typeof map.forEach === "function") {
+                      map.forEach((entry) => { if (!term) term = pickTerm(entry); });
+                    }
+                  }
+                }
+              } catch (_) {}
             }
 
             let isDisconnected = false;
@@ -660,8 +712,8 @@ async function connectWS() {
           world: "MAIN",
           args: [target],
           func: async (keyword) => {
-            const searchInput = document.querySelector("#assetsSearchInput, .tree-input");
-            if (!searchInput) return { ok: false, error: "未在当前页面找到 JumpServer 资产搜索框 (#assetsSearchInput)" };
+            const searchInput = document.querySelector("#assetsSearchInput, #AssetTreeSearchInput, .tree-input");
+            if (!searchInput) return { ok: false, error: "未在当前页面找到 JumpServer 资产搜索框 (#assetsSearchInput / #AssetTreeSearchInput)" };
 
             searchInput.value = keyword;
             searchInput.dispatchEvent(new Event("input", { bubbles: true }));
@@ -891,61 +943,106 @@ async function executeInWebTerminal(cmd, timeoutMs) {
   const xtermEl = allXtermEls.find(el => el.offsetParent !== null) || allXtermEls[0];
 
   function findXtermInstance(startEl) {
-    const isTerm = (obj) => obj && typeof obj.paste === "function" && obj.buffer && obj.buffer.active;
+    const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
+    const seen = new Set();
+    const candidates = [];
 
-    // 0. 全局 window 探测
-    if (isTerm(window.term)) return window.term;
-    if (isTerm(window.terminal)) return window.terminal;
-    if (isTerm(window.xterm)) return window.xterm;
-    if (isTerm(window._term)) return window._term;
+    const consider = (obj) => {
+      if (!obj || typeof obj !== "object" || seen.has(obj)) return;
+      seen.add(obj);
+      if (isTerm(obj)) candidates.push(obj);
+      if (isTerm(obj.terminal)) candidates.push(obj.terminal);
+      if (isTerm(obj.term)) candidates.push(obj.term);
+      if (isTerm(obj.value)) candidates.push(obj.value);
+      if (isTerm(obj._value)) candidates.push(obj._value);
+    };
 
-    let el = startEl;
-    while (el) {
-      // 1. DOM 属性直接挂载探测 (DOPS / 自研平台常见: modal._terminal, el.term, el._xterm)
-      if (isTerm(el._terminal)) return el._terminal;
-      if (isTerm(el.term)) return el.term;
-      if (isTerm(el._xterm)) return el._xterm;
-      if (isTerm(el.terminal)) return el.terminal;
-      if (isTerm(el.__xterm__)) return el.__xterm__;
-
-      // 2. Vue 2 探测
-      if (el.__vue__) {
-        if (isTerm(el.__vue__.term)) return el.__vue__.term;
-        if (isTerm(el.__vue__.xterm)) return el.__vue__.xterm;
-        if (isTerm(el.__vue__._terminal)) return el.__vue__._terminal;
-        for (const val of Object.values(el.__vue__)) {
-          if (isTerm(val)) return val;
-        }
+    const walkValue = (val, depth) => {
+      if (!val || depth > 4 || typeof val !== "object") return;
+      if (seen.has(val)) return;
+      consider(val);
+      if (typeof val.forEach === "function" && (val instanceof Map || typeof val.get === "function")) {
+        try { val.forEach((entry) => consider(entry)); } catch (_) {}
+        return;
       }
-      // 3. Vue 3 探测
+      if (Array.isArray(val)) {
+        for (const item of val) consider(item);
+        return;
+      }
+      let n = 0;
+      for (const k of Object.keys(val)) {
+        if (n++ > 40) break;
+        if (k === "buffer" || k === "_core" || k === "element") continue;
+        try { consider(val[k]); } catch (_) {}
+      }
+    };
+
+    const searchVue3VNode = (vnode, depth) => {
+      if (!vnode || depth > 14) return;
+      const inst = vnode.component;
+      if (inst) {
+        const pools = [inst.setupState, inst.ctx, inst.exposed, inst.data, inst.props].filter(Boolean);
+        for (const pool of pools) walkValue(pool, 0);
+      }
+      const kids = vnode.children;
+      if (Array.isArray(kids)) {
+        for (const kid of kids) searchVue3VNode(kid, depth + 1);
+      } else if (kids && typeof kids === "object") {
+        searchVue3VNode(kids, depth + 1);
+      }
+    };
+
+    consider(window.term);
+    consider(window.terminal);
+    consider(window.xterm);
+    consider(window._term);
+
+    const scanEl = (el) => {
+      if (!el) return;
+      consider(el._terminal);
+      consider(el.term);
+      consider(el._xterm);
+      consider(el.terminal);
+      consider(el.__xterm__);
+      if (el.__vue__) {
+        consider(el.__vue__.term);
+        consider(el.__vue__.xterm);
+        consider(el.__vue__._terminal);
+        consider(el.__vue__.$store?.state?.terminal);
+        walkValue(el.__vue__, 0);
+      }
       const v3 = el.__vueParentComponent;
       if (v3) {
-        const pools = [v3.ctx, v3.exposed, v3.setupState, v3.data].filter(Boolean);
-        for (const pool of pools) {
-          if (isTerm(pool?.term)) return pool.term;
-          if (isTerm(pool?.xterm)) return pool.xterm;
-          if (isTerm(pool?._terminal)) return pool._terminal;
-          for (const val of Object.values(pool)) {
-            if (isTerm(val)) return val;
-          }
+        for (const pool of [v3.ctx, v3.exposed, v3.setupState, v3.data].filter(Boolean)) {
+          walkValue(pool, 0);
         }
+        try { searchVue3VNode(v3.vnode || v3.subTree, 0); } catch (_) {}
       }
-      // 4. React Fiber 探测 (现代 React 弹窗/容器)
+      try {
+        const app = el.__vue_app__;
+        const pinia = app?.config?.globalProperties?.$pinia;
+        const state = pinia?.state?.value;
+        if (state && typeof state === "object") {
+          for (const bucket of Object.values(state)) walkValue(bucket, 0);
+        }
+        const vuex = app?.config?.globalProperties?.$store?.state;
+        if (vuex) walkValue(vuex, 0);
+      } catch (_) {}
       for (const k in el) {
         if (k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")) {
           let cur = el[k];
           let depth = 0;
           while (cur && depth < 12) {
             if (cur.stateNode) {
-              if (isTerm(cur.stateNode.term)) return cur.stateNode.term;
-              if (isTerm(cur.stateNode.xterm)) return cur.stateNode.xterm;
-              if (isTerm(cur.stateNode._terminal)) return cur.stateNode._terminal;
+              consider(cur.stateNode.term);
+              consider(cur.stateNode.xterm);
+              consider(cur.stateNode._terminal);
             }
             if (cur.memoizedState) {
               let s = cur.memoizedState;
               while (s) {
-                if (isTerm(s.memoizedState?.current)) return s.memoizedState.current;
-                if (isTerm(s.memoizedState)) return s.memoizedState;
+                consider(s.memoizedState?.current);
+                consider(s.memoizedState);
                 s = s.next;
               }
             }
@@ -954,20 +1051,25 @@ async function executeInWebTerminal(cmd, timeoutMs) {
           }
         }
       }
+    };
 
+    let el = startEl;
+    while (el) {
+      scanEl(el);
       el = el.parentElement;
     }
 
-    // 5. 页面弹窗容器集中探查
-    const modals = document.querySelectorAll('.modal, .modal-mask, [class*="modal"], [class*="dialog"], [role="dialog"]');
-    for (const m of modals) {
-      if (isTerm(m._terminal)) return m._terminal;
-      if (isTerm(m.term)) return m.term;
-      if (isTerm(m._xterm)) return m._xterm;
-      if (isTerm(m.terminal)) return m.terminal;
-    }
+    const roots = document.querySelectorAll("#app, [data-v-app], .modal, .modal-mask, [class*='modal'], [class*='dialog'], [role='dialog']");
+    for (const m of roots) scanEl(m);
 
-    return null;
+    if (candidates.length === 0) return null;
+    const visible = candidates.find((t) => {
+      const node = t.element || t.textarea;
+      if (!node || typeof node.getBoundingClientRect !== "function") return false;
+      const r = node.getBoundingClientRect();
+      return node.offsetParent !== null && r.width > 0 && r.height > 0;
+    });
+    return visible || candidates[0];
   }
 
   const term = findXtermInstance(xtermEl);
@@ -1006,6 +1108,7 @@ async function executeInWebTerminal(cmd, timeoutMs) {
     if (/Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tailText)) {
       return {
         matched: true,
+        tier: 1,
         ok: false,
         error: "当前 Web 终端连接已断开 (Connection closed)，请重新连接后再执行命令",
         partialOutput: tailText,
@@ -1066,6 +1169,7 @@ async function executeInWebTerminal(cmd, timeoutMs) {
         cleanup();
         resolve({
           matched: true,
+          tier: 1,
           ok: false,
           error: `指令在 ${timeoutMs}ms 内未执行完（可能卡在交互式输入或耗时命令）`,
           partialOutput: partial.slice(-2000),
@@ -1086,6 +1190,7 @@ async function executeInWebTerminal(cmd, timeoutMs) {
         cleanup();
         resolve({
           matched: true,
+          tier: 1,
           ok: true,
           exitCode: 0,
           output,
@@ -1384,9 +1489,13 @@ async function executeInWebTerminal(cmd, timeoutMs) {
   function discoverUniversalTerminalTarget() {
     // 1. 寻找可视终端渲染画布/容器（用于判断是否终端页及点击唤醒焦点）
     const surfaceCandidates = Array.from(
-      document.querySelectorAll("canvas, .xterm, .xterm-screen, pre, [class*='term' i], [id*='term' i], [class*='guac' i], [id*='guac' i], [class*='console' i], [class*='shell' i], [class*='ssh' i], [class*='tty' i]")
+      document.querySelectorAll("canvas, .xterm, .xterm-screen, pre, [class*='xterm' i], [class*='terminal' i], [class*='webterm' i], [class*='guac' i], [id*='guac' i], [class*='console' i], [class*='shell' i], [class*='ssh' i], [class*='tty' i]")
     ).filter(el => {
       if (el instanceof SVGElement) return false;
+      const cls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""}`;
+      if (/watermark/i.test(cls)) return false;
+      const style = window.getComputedStyle(el);
+      if (style.pointerEvents === "none") return false;
       const r = el.getBoundingClientRect();
       return r.width >= 160 && r.height >= 100;
     });
@@ -1417,12 +1526,14 @@ async function executeInWebTerminal(cmd, timeoutMs) {
       const style = window.getComputedStyle(el);
 
       if (style.display === "none" || style.visibility === "hidden") return -1;
+      if (/watermark/i.test(idCls)) return -1;
 
       // 特征 1: 包含零宽空格 \u200b (Guacamole / 远程终端经典光标陷阱特征)
       if (val.includes("\u200b")) score += 65;
 
-      // 特征 2: 经典终端类名/ID 命中
-      if (/xterm-helper-textarea|inputArea|guac|term|tty|ssh|shell|console|cmd|clipboard|ime/i.test(idCls)) {
+      // 特征 2: 经典终端类名/ID 命中（不用裸 term，避免 Luna 全屏水印 watermark 误命中）
+      const termTrapRegex = /(?:xterm-helper-textarea|inputArea|guac|xterm|terminal|webterm|(?:^|[^a-z])(?:term|tty|ssh|shell|console|cmd|clipboard|ime)(?:$|[^a-z]))/i;
+      if (termTrapRegex.test(idCls)) {
         score += 40;
       }
 
@@ -1446,6 +1557,14 @@ async function executeInWebTerminal(cmd, timeoutMs) {
     const allInputs = Array.from(document.querySelectorAll("textarea, input, [contenteditable='true']"));
     let scored = allInputs.map(el => ({ el, score: scoreInputTrap(el) })).filter(x => x.score > 0);
     scored.sort((a, b) => b.score - a.score);
+
+    const childIframes = Array.from(document.querySelectorAll("iframe")).filter(f => {
+      const r = f.getBoundingClientRect();
+      return r.width >= 160 && r.height >= 100;
+    });
+    if (childIframes.length > 0 && !(scored.length > 0 && scored[0].score >= 35)) {
+      return null;
+    }
 
     if (scored.length > 0 && scored[0].score >= 35) {
       return { inputEl: scored[0].el, surfaceEl: primarySurface, score: scored[0].score, method: "heuristic-trap" };
@@ -1493,19 +1612,28 @@ async function executeInWebTerminal(cmd, timeoutMs) {
     }
 
     // 模式 2: 隐藏或标准 Textarea / Input
+    // xterm 的 _inputEvent 只接受 inputType=insertText 且 data 非空；execCommand("insertText")
+    // 会把 \r 拆成 insertLineBreak 且 data=null，命令或回车会被丢掉。composed 必须为 false，
+    // 否则在刚发生过 keydown 时会被 _keyDownSeen 丢弃。
     if (targetEl.tagName === "TEXTAREA" || targetEl.tagName === "INPUT") {
       targetEl.focus();
-      let sent = false;
+      targetEl.dispatchEvent(new Event("focus"));
+      targetEl.dispatchEvent(new KeyboardEvent("keyup", { key: "Shift", code: "ShiftLeft", keyCode: 16, which: 16, bubbles: true }));
+      const inputEvt = new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        composed: false,
+        data: `${commandText}\r`,
+        inputType: "insertText"
+      });
+      targetEl.dispatchEvent(inputEvt);
+      if (inputEvt.defaultPrevented || targetEl.classList?.contains("xterm-helper-textarea")) return;
       try {
-        sent = document.execCommand("insertText", false, `${commandText}\r`);
+        document.execCommand("insertText", false, commandText);
       } catch (_) {}
-      if (!sent) {
-        targetEl.value = `${commandText}\r`;
-        targetEl.dispatchEvent(new InputEvent("input", { bubbles: true, data: `${commandText}\r`, inputType: "insertText" }));
-        targetEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-        targetEl.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13, bubbles: true }));
-        targetEl.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-      }
+      targetEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      targetEl.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, which: 13, charCode: 13, bubbles: true }));
+      targetEl.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
       return;
     }
 
@@ -1565,6 +1693,7 @@ async function executeInWebTerminal(cmd, timeoutMs) {
         if (afterLines.length === 0) {
           resolve({
             matched: true,
+            tier: 3,
             ok: true,
             output: `[已通过通用终端通道 (${universalTarget.method}: <${universalTarget.inputEl.tagName.toLowerCase()}${universalTarget.inputEl.id ? "#" + universalTarget.inputEl.id : ""}>) 下发命令: ${cleanCmd}] (当前终端采用纯画布渲染无 DOM 文本节点)`
           });
@@ -1813,8 +1942,10 @@ function probePageInteractiveCapabilities() {
       const rect = el.getBoundingClientRect();
       const idCls = `${el.id || ""} ${typeof el.className === "string" ? el.className : ""} ${el.parentElement?.className || ""}`;
       let score = 0;
+      if (/watermark/i.test(idCls)) return { el, score: -1, selector: "", isFocused: false, isOffscreen: false, hasZeroWidthTrap: false };
       if (val.includes("\u200b")) score += 65;
-      if (/xterm-helper-textarea|inputArea|guac|term|tty|ssh|shell|console|cmd|clipboard|ime/i.test(idCls)) score += 40;
+      const termTrapRegex = /(?:xterm-helper-textarea|inputArea|guac|xterm|terminal|webterm|(?:^|[^a-z])(?:term|tty|ssh|shell|console|cmd|clipboard|ime)(?:$|[^a-z]))/i;
+      if (termTrapRegex.test(idCls)) score += 40;
       if (el === document.activeElement) score += 35;
       if (el.getAttribute("autocorrect") === "off" || el.getAttribute("autocapitalize") === "off") score += 25;
       if (el.tagName === "TEXTAREA" && (rect.right <= 0 || rect.bottom <= 0 || rect.left < -10)) score += 30;
