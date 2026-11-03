@@ -23,8 +23,9 @@
 - **👥 双人并发与后台多标签隔离 (True Background Concurrency)**：
   - 使用 `bctl new <url>` 在后台静默创建标签页并自动绑定，前台人类正在浏览的网页**绝不切页、绝不夺取焦点**。
   - 大模型在后台标签页自由执行点击、滚动、表单提交，人类在前台正常打字聊天，互不干扰。
-- **⚡ 全类型 Web 终端直连穿透 (`bctl exec`)**：
-  - 直连 JumpServer (Luna/Koko)、DOPS / Rancher K8s 容器终端、自研 WebShell 等基于 xterm.js 的各类 Web 终端。支持跨 iframe 递归探测、Vue/React 深度实例穿透、DOM 极速拟真键入回退、软折行（isWrapped）还原拼接、防后台休眠与纯净原样命令下发，毫秒级返回干净的标准输出。
+- **⚡ 多类型 Web 终端发现与命令执行 (`bctl probe` / `bctl exec`)**：
+  - 优先使用终端公开的输入/输出接口；其它页面根据可访问名称、可见提示符、焦点和输入控件结构形成候选。`probe` 返回候选 frame、编号、证据和置信度；只有目标唯一且证据充分时，`exec` 才会自动发送命令。无法唯一判断时，可用 `--target` 选择。
+  - 能否覆盖新终端取决于页面是否暴露可读 DOM 或键盘输入节点。只绘制像素、没有可访问名称和输入节点的画布，浏览器扩展无法可靠判断画面里哪个位置是命令行；这类页面需要针对其公开接口做适配。
 - **🔍 智能页面环境嗅探与 DevTools 直连 (`bctl probe` / `bctl devtools`)**：
   - 一键嗅探页面当前就绪的终端、Monaco / Ace / CodeMirror 代码编辑器与主表单；
   - 穿透 Kibana DevTools 与自研 ES 控制台，自动注入查询语句并模拟触发原生快捷键提交，毫秒级抓取响应输出。
@@ -158,12 +159,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 | :--- | :--- | :--- |
 | **查看标签页** | `bctl tabs` | 查看 Chrome 当前所有已打开的标签（包含 TabID、标题、URL、绑定状态） |
 | **后台打开网页** | `bctl new "https://github.com"` | **强烈推荐**：在后台静默创建标签页并自动绑定，前台人类视角 0 干扰 |
-| **锁定控制目标** | `bctl bind 947878209` 或 `bctl bind jumpserver` | 将后续操作锁定在指定标签页，禁止后台休眠（推荐优先用 TabID，关键词多匹配时自动拦截冲突） |
+| **锁定控制目标** | `bctl bind 947878209` | 将后续操作锁定在指定标签页；先用 `bctl tabs` 确认目标并优先使用数字 TabID |
 | **内嵌终端标签列表** | `bctl subtabs` (或 `terms`) | 查看当前页面内嵌的终端标签列表与连接健康状态 (JumpServer 等多标签终端) |
 | **内嵌终端标签切换** | `bctl switch <IP\|序号>` | 在当前页面像切浏览器标签一样直接切换内嵌终端，零重复新开 |
 | **智能按需连接** | `bctl connect <IP> [--new]` | 智能按需连接主机（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
-| **页面环境嗅探** | `bctl probe` | 一键嗅探页面当前就绪的终端（Xterm）、编辑器（Monaco/Ace/CodeMirror）与主表单 |
-| **Web 终端执行** | `bctl exec "ps -ef \| grep es"` | 穿透各类 Web 终端 (JumpServer/DOPS/K8s/Xterm) 执行命令并返回标准输出 |
+| **页面环境嗅探** | `bctl probe` | 跨 frame 列出终端候选、定位证据、置信度，以及 Monaco/Ace/CodeMirror 编辑器 |
+| **Web 终端执行** | `bctl exec 'uname -a'` | 目标明确时自动选择终端；候选不唯一时，用 `bctl exec --target <frameId>:<候选序号> 'uname -a'` 指定 |
 | **DevTools 执行** | `bctl devtools "GET _cat/indices?v"` | 在 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |
 | **感知视口元素** | `bctl look` | 静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要（不再渲染数字角标） |
 | **执行鼠标/键盘动作** | `bctl act '<JSON动作数组>'` | 执行点击、输入、按键、智能容器滚动（实时在顶部胶囊打印具体动作） |
@@ -177,16 +178,23 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 
 ## 🎯 典型使用场景示例
 
-### 场景一：后台操控 JumpServer 堡垒机执行运维命令
-```bash
-# 1. 查找已打开的 JumpServer 页面并绑定
-bctl tabs
-bctl bind jumpserver
+首次使用任意堡垒机或自研终端时，先用 `bctl tabs` 查看标签页，再将输出中的数字 TabID 传给 `bctl bind`。不要依赖系统名称或页面关键词来猜测绑定目标。运行 `bctl probe` 后，若终端候选不唯一，可通过候选 ID（`frameId:index`）明确选择：
 
-# 2. 在后台静默执行 Linux 命令（不影响你前台打字看网页）
-bctl exec "ps -ef | grep jenkins"
-bctl exec "systemctl status jenkins"
-bctl exec "df -h"
+```bash
+bctl tabs
+bctl bind 12345
+bctl probe
+bctl exec --target 0:0 'uname -a'
+```
+
+### 场景一：在已绑定的 Web 终端执行运维命令
+```bash
+# 先运行 bctl tabs 并把下方数字替换成目标页的 TabID
+bctl bind 12345
+bctl probe
+bctl exec 'ps -ef | grep jenkins'
+bctl exec 'systemctl status jenkins'
+bctl exec 'df -h'
 ```
 
 ### 场景二：后台自动化普通网站（带弹簧鼠标与打字机动画）
@@ -207,8 +215,8 @@ bctl act '[{"type":"click","id":4}]'
 
 ### 场景三：大盘监控与表格数据分析
 ```bash
-# 1. 绑定监控大盘
-bctl bind monitor
+# 先根据 bctl tabs 的结果选择目标标签页
+bctl bind 12345
 
 # 2. 滚动并触发虚拟列表渲染
 bctl act '[{"type":"scroll","deltaY":800}]'
@@ -219,16 +227,15 @@ bctl look
 
 ### 场景四：DOPS/K8s 容器终端与 Kibana/ES 控制台执行
 ```bash
-# 1. 一键嗅探页面内是否有活跃的终端或编辑器
-bctl bind dops
+# 先根据 bctl tabs 的结果选择目标标签页
+bctl bind 12345
 bctl probe
 
-# 2. 在非标容器终端 (DOPS / 自研终端) 中直接执行命令
-bctl exec "uname -a"
-bctl exec "ls -la /app"
+# 终端候选唯一且可信时可自动执行；否则按 probe 返回的 frameId:index 指定
+bctl exec 'uname -a'
+bctl exec --target 0:0 'ls -la /app'
 
-# 3. 在 Kibana DevTools / 自研 ES 控制台执行 DSL 查询
-bctl bind elasticsearch
+# 在 Kibana DevTools / 自研 ES 控制台执行 DSL 查询
 bctl devtools "GET _cat/indices?v"
 bctl devtools 'GET k8s-logs-*/_search\n{"size":5,"query":{"match_all":{}}}'
 ```

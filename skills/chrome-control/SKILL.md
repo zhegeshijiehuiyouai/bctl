@@ -18,12 +18,12 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 | :--- | :--- |
 | `bctl new "<url>"` | 后台新建标签页、自动绑定并返回页面元素摘要 |
 | `bctl tabs` | 列出所有标签页（TabID、标题、URL、绑定与前台状态） |
-| `bctl bind <TabID\|关键词>` | 绑定指定标签页并关闭后台休眠（推荐 `bctl bind <TabID>`；关键词匹配到多实例时将自动拦截报警） |
+| `bctl bind <TabID>` | 绑定指定标签页并关闭后台休眠；先用 `bctl tabs` 确认目标，执行类操作优先使用数字 TabID |
 | `bctl subtabs` / `terms` | 列出当前页面内嵌的终端标签列表与健康状态（支持 JumpServer 等多标签终端） |
 | `bctl switch <IP\|序号>` | 在当前页面直接切换到指定的内嵌终端标签页（如切浏览器标签一样无缝切换） |
 | `bctl connect <IP> [--new]` | 智能按需连接（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
-| `bctl probe` | 一键嗅探页面当前就绪的终端（Xterm）、编辑器（Monaco/Ace/CodeMirror）与主表单 |
-| `bctl exec '<shell命令>'` | 在绑定的 Web 终端 (JumpServer/DOPS/K8s/自研 Xterm) 穿透执行命令并返回标准输出 |
+| `bctl probe` | 跨 frame 列出终端候选、定位证据、置信度，以及 Monaco/Ace/CodeMirror 编辑器 |
+| `bctl exec [--target frameId:index] '<shell命令>'` | 在已识别的 Web 终端执行命令；目标不唯一时先从 probe 结果中选择 |
 | `bctl devtools "<查询>"` | 在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |
 | `bctl look` | 扫描当前视口可交互元素与可见表格/指标数据，返回 `[0]`, `[1]`... 编号摘要 |
 | `bctl act '<JSON数组>'` | 执行交互动作并返回最新页面摘要 |
@@ -52,11 +52,9 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 ## Web 终端与 DevTools 执行规范
 
 ### 1. 快速嗅探页面交互环境 (`bctl probe`)
-在面对非标运维后台、容器终端（如 DOPS、自研 WebShell）或数据查询页面（Kibana DevTools、自研 ES 控制台）时：
-- 先运行 `bctl probe`，即可一键返回页面内探测到的：
-  - **终端实例**：DOM 容器路径、行列规格、以及当前终端最新内容快照；
-  - **编辑器实例**：Monaco Editor、Ace Editor、CodeMirror 及其绑定的当前文本与执行按钮；
-  - **活跃表单输入控件**。
+接管任意新堡垒机页面时，先运行 `bctl tabs`，根据标题和 URL 确认页面，再使用数字 TabID 执行 `bctl bind <TabID>`；不要依靠产品关键词猜测绑定目标。
+
+对未知终端运行 `bctl probe`。`terminals` 中每项包含 `candidateId`（`frameId:index`）、定位方式、置信度和证据；`editors` 单独列出编辑器候选。
 - `bctl look` 也会在底部自动附带 `[页面内嵌代码/查询编辑器]` 与 `[页面内嵌 Web 终端]` 的状态标识。
 
 ### 2. Web 终端连接与命令下发 (`bctl connect` / `bctl switch` / `bctl exec`)
@@ -65,14 +63,10 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
   - 先运行 `bctl subtabs` 查看已有终端标签，或直接使用 `bctl connect <IP>`。
   - `bctl connect <IP>` 会优先检测并复用现有活跃终端标签；仅当标签不存在、或已断开连接（`Connection closed`）时才自动重连；如确需同时打开多个终端，显式传入 `--new`。
   - 需要在已有终端间切换时，执行 `bctl switch <IP|标题|序号>` 瞬间无缝切换。
-- **Web 终端命令穿透**：
-  - 支持 JumpServer (Luna/Koko)、华为云堡垒机/齐治/云匣子 (Apache Guacamole Canvas + X11 Keysym)、K8s 容器终端 (DOPS / Rancher / Kubernetes Dashboard)、基于 Xterm.js 的各类自研 Web 终端，以及非标自研 WebShell。
-  - **四级自适应探测与通用输入兜底架构**：
-    1. **Level 1 (协议/实例直连)**：自动递归穿透 iframe、Vue/React 实例提取 `term` (Xterm.js) 或 `Guacamole.Client` (云堡垒机 Canvas + X11 Keysym + 静默剪贴板流屏幕读取)；
-    2. **Level 2 (隐藏输入陷阱启发式嗅探)**：针对各类非标终端将 `<textarea>` 藏于视口外（如 `left: -582px` 的 `#inputArea.target`）或透明层的物理共性，突破视口限制扫描零宽字符哨兵（`\u200b`）、`autocorrect="off"`、`document.activeElement` 等特征，自动定位隐藏输入口；
-    3. **Level 3 (主动点击唤醒 + 多模派发)**：若未直接命中，自动模拟点击主画布中心唤醒隐藏输入框焦点，并根据目标特征自适应切换零宽字符注入、`execCommand("insertText")` 或 Canvas 逐字符物理键盘事件流；
-    4. **Level 4 (`bctl look` / `bctl act` 可视化兜底)**：`bctl look` 会将探测到的视口外隐藏终端输入口显式暴露在编号列表中（标注 `[Web终端隐藏命令输入口]`），即使不走 `bctl exec`，也可直接对该编号执行 `bctl act` 的 `type` / `press` 下发命令。
-  - 终端连接目标服务器后，直接调用 `bctl exec '<shell命令>'`。
+- **Web 终端命令执行**：`bctl exec '<shell命令>'` 会先只读扫描所有 frame，再选择候选，最后只向单个目标下发命令。终端公开 Xterm 或远程桌面 API 时优先使用该 API；其它页面根据可访问名称、提示符文本、焦点和输入控件结构打分。
+- 自动执行仅在唯一候选达到置信度门槛时发生。若返回多个候选，按 `candidateId` 明确指定，例如 `bctl exec --target 12:0 'uname -a'`。若没有足够证据，命令不会发送；检查 `probe` 输出后再指定候选。
+- 纯像素 Canvas 若未暴露可访问名称、可聚焦键盘面或 DOM 输入节点，浏览器扩展无法像人一样理解画面；这需要页面自身提供可访问语义或单独适配。未能读取命令回显时，bctl 会报告结果未知；先查看终端状态，不要盲目重放命令。
+- 对可识别的 Xterm 和 Guacamole 页面，bctl 仍使用对应运行时接口提升输入和回显准确度；这些优化不会改变通用候选选择流程。
 
 ### 3. Kibana DevTools 与代码编辑器查询 (`bctl devtools`)
 - 支持 Kibana DevTools、自研 ES 查询平台、Monaco Editor、Ace Editor 与 CodeMirror。

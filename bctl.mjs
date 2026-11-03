@@ -170,7 +170,7 @@ bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及
   bctl subtabs / terms     查看当前页面内嵌的终端标签列表与连接状态 (JumpServer 等多标签终端)
   bctl switch <IP|序号>    在当前页面一键切换到指定的内嵌终端标签页 (不重新打开)
   bctl connect <IP> [--new] 智能连接主机 (优先复用已连接终端，断开自动重连，支持 --new 强制新开)
-  bctl exec "<shell命令>"  在绑定的 Web 终端 (JumpServer / DOPS / K8s / Xterm) 中穿透执行命令并获取输出
+  bctl exec [--target frameId:index] "<shell命令>"  在已识别的 Web 终端中执行命令
   bctl devtools "<查询>"   在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器中填充并执行查询
   bctl probe               一键嗅探当前页面所有就绪终端、编辑器 (Monaco / Ace / CodeMirror) 与表单
   bctl look                静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要
@@ -182,11 +182,13 @@ bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及
 使用场景:
   1. 后台操作堡垒机或自研 K8s 容器终端 (不影响你在前台浏览其它网页):
      bctl tabs
-     bctl bind jumpserver  # 或 bctl bind dops
+     bctl bind <tabs 输出中的数字 TabID>
+     bctl probe
      bctl exec "ps -ef | grep multica"
 
   2. 后台操作 Kibana DevTools / 自研 ES 查询控制台:
-     bctl bind elastic
+     bctl tabs
+     bctl bind <TabID>
      bctl devtools "GET _cat/indices?v"
 
   3. 普通网页自动化 (带拟人光标与动画):
@@ -246,12 +248,24 @@ if (cmd === "daemon") {
   const result = await sendCommand("term_connect", { target, forceNew, timeoutMs: 15000 });
   console.log(result);
 } else if (cmd === "exec" || cmd === "term-exec") {
-  const commandToRun = args.slice(1).join(" ");
+  let commandArgs = args.slice(1);
+  let candidateTarget = null;
+  if (commandArgs[0] === "--target") {
+    const target = commandArgs[1] || "";
+    const match = target.match(/^(\d+):(\d+)$/);
+    if (!match) {
+      console.error("用法: bctl exec --target <frameId>:<候选序号> '<shell命令>'");
+      process.exit(1);
+    }
+    candidateTarget = { frameId: Number(match[1]), index: Number(match[2]) };
+    commandArgs = commandArgs.slice(2);
+  }
+  const commandToRun = commandArgs.join(" ");
   if (!commandToRun) {
-    console.error("用法: bctl exec \"<在 Web 终端 (JumpServer/DOPS/K8s/Xterm) 中执行的 shell 命令>\"");
+    console.error("用法: bctl exec [--target <frameId>:<候选序号>] '<shell命令>'");
     process.exit(1);
   }
-  const result = await sendCommand("term_exec", { cmd: commandToRun, timeoutMs: 20000 });
+  const result = await sendCommand("term_exec", { cmd: commandToRun, timeoutMs: 20000, candidateTarget });
   console.log(result);
 } else if (cmd === "devtools" || cmd === "query" || cmd === "console") {
   const queryToRun = args.slice(1).join(" ");
