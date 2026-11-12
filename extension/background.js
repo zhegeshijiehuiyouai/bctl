@@ -187,7 +187,10 @@ async function connectWS() {
         "term_connect",
         "term_switch",
         "term_tabs",
-        "subtabs"
+        "subtabs",
+        "term_screen",
+        "term_key",
+        "term_start"
       ]);
 
       const needBound = REQUIRE_BOUND_ACTIONS.has(action);
@@ -216,36 +219,7 @@ async function connectWS() {
           payload: { text: `正在执行命令: ${cmdSummary}` }
         }).catch(() => {});
 
-        const discoveryResults = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, allFrames: true },
-          world: "MAIN",
-          args: ["", 0, null, true],
-          func: executeInWebTerminal
-        });
-        const candidates = (discoveryResults || []).flatMap(frame =>
-          (frame?.result?.candidates || []).map(candidate => ({
-            ...candidate,
-            frameId: frame.frameId,
-            candidateId: `${frame.frameId}:${candidate.index}`
-          }))
-        );
-        let selected = null;
-        let selectionError = "";
-        if (candidateTarget) {
-          selected = candidates.find(candidate => candidate.frameId === candidateTarget.frameId && candidate.index === candidateTarget.index) || null;
-          if (!selected) selectionError = `目标 ${candidateTarget.frameId}:${candidateTarget.index} 已不存在；页面可能已变化，请重新运行 bctl probe。`;
-        } else {
-          const credible = candidates.filter(candidate => candidate.confidence >= 75).sort((a, b) => b.confidence - a.confidence);
-          if (credible.length === 0) {
-            selectionError = candidates.length
-              ? `没有足够证据自动选择终端，候选 ${candidates.map(candidate => `${candidate.candidateId} ${candidate.selector} (${candidate.confidence}%)`).join("；")}`
-              : "没有发现可信的终端输入目标";
-          } else if (credible.length > 1 && credible[0].confidence - credible[1].confidence < 15) {
-            selectionError = `发现多个同等可信的终端候选：${credible.map(candidate => `${candidate.candidateId} ${candidate.selector} (${candidate.confidence}%)`).join("；")}`;
-          } else {
-            selected = credible[0];
-          }
-        }
+        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
 
         if (!selected) {
           chrome.tabs.sendMessage(targetTab.id, {
@@ -289,6 +263,95 @@ async function connectWS() {
             result: `[执行异常/超时] ${hit.error || "未知错误"}\n${hit.partialOutput || ""}`
           }));
         }
+        return;
+      }
+
+      // ─── 动作 3.1: 终端全屏字符网格快照 (bctl screen / term_screen) ───
+      if (action === "term_screen") {
+        const candidateTarget = payload.candidateTarget || null;
+        await ensureContentScript(targetTab.id);
+        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
+        if (!selected) {
+          ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
+          return;
+        }
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+          world: "MAIN",
+          args: ["", 0, selected.index, false, selected.kind, { mode: "screen" }],
+          func: executeInWebTerminal
+        });
+        const execution = results?.find(frame => frame?.result?.matched === true);
+        if (!execution || !execution.result) {
+          ws.send(JSON.stringify({ id, result: { ok: false, error: "未能读取目标终端屏幕" } }));
+          return;
+        }
+        ws.send(JSON.stringify({ id, result: execution.result }));
+        return;
+      }
+
+      // ─── 动作 3.2: 终端交互按键与转义序列发送 (bctl key / term_key) ───
+      if (action === "term_key") {
+        const keys = payload.keys || "";
+        const candidateTarget = payload.candidateTarget || null;
+        const settleMs = payload.settleMs || 150;
+        await ensureContentScript(targetTab.id);
+        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
+        if (!selected) {
+          ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
+          return;
+        }
+
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: `发送按键: ${keys.slice(0, 20)}` }
+        }).catch(() => {});
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+          world: "MAIN",
+          args: ["", 0, selected.index, false, selected.kind, { mode: "key", keys, settleMs }],
+          func: executeInWebTerminal
+        });
+        const execution = results?.find(frame => frame?.result?.matched === true);
+        if (!execution || !execution.result) {
+          ws.send(JSON.stringify({ id, result: { ok: false, error: "向目标终端发送按键失败" } }));
+          return;
+        }
+        ws.send(JSON.stringify({ id, result: execution.result }));
+        return;
+      }
+
+      // ─── 动作 3.3: 启动交互式 TUI 程序 (bctl start / term_start) ───
+      if (action === "term_start") {
+        const cmd = payload.cmd || "";
+        const candidateTarget = payload.candidateTarget || null;
+        const settleMs = payload.settleMs || 800;
+        await ensureContentScript(targetTab.id);
+        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
+        if (!selected) {
+          ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
+          return;
+        }
+
+        chrome.tabs.sendMessage(targetTab.id, {
+          action: "set_status",
+          payload: { text: `启动交互程序: ${cmd.slice(0, 24)}` }
+        }).catch(() => {});
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+          world: "MAIN",
+          args: [cmd, 0, selected.index, false, selected.kind, { mode: "start", settleMs }],
+          func: executeInWebTerminal
+        });
+        const execution = results?.find(frame => frame?.result?.matched === true);
+        if (!execution || !execution.result) {
+          ws.send(JSON.stringify({ id, result: { ok: false, error: "启动目标交互程序失败" } }));
+          return;
+        }
+        ws.send(JSON.stringify({ id, result: execution.result }));
         return;
       }
 
@@ -925,8 +988,71 @@ function waitForTabLoad(tabId) {
   });
 }
 
+// ─── 统一解析并选择最佳 Web 终端候选 (支持 Xterm/Guacamole/通用输入框优先级排序) ───
+async function resolveSelectedTerminal(targetTabId, candidateTarget = null) {
+  const discoveryResults = await chrome.scripting.executeScript({
+    target: { tabId: targetTabId, allFrames: true },
+    world: "MAIN",
+    args: ["", 0, null, true],
+    func: executeInWebTerminal
+  });
+  const candidates = (discoveryResults || []).flatMap(frame =>
+    (frame?.result?.candidates || []).map(candidate => ({
+      ...candidate,
+      frameId: frame.frameId,
+      candidateId: `${frame.frameId}:${candidate.index}`
+    }))
+  );
+
+  if (candidateTarget) {
+    const selected = candidates.find(c => c.frameId === candidateTarget.frameId && c.index === candidateTarget.index) || null;
+    return {
+      selected,
+      candidates,
+      error: selected ? "" : `目标 ${candidateTarget.frameId}:${candidateTarget.index} 已不存在；页面可能已变化，请重新运行 bctl probe。`
+    };
+  }
+
+  const getKindWeight = (kind) => {
+    if (kind === "xterm") return 100;
+    if (kind === "guac") return 90;
+    return 50;
+  };
+
+  const credible = candidates.filter(c => c.confidence >= 75);
+  if (credible.length === 0) {
+    return {
+      selected: null,
+      candidates,
+      error: candidates.length
+        ? `没有足够证据自动选择终端，候选 ${candidates.map(c => `${c.candidateId} ${c.selector} (${c.confidence}%)`).join("；")}`
+        : "没有发现可信的终端输入目标"
+    };
+  }
+
+  // 若存在高置信度的 xterm 或 guac 真实终端实例，优先选择，防止父级页面通用搜索框干扰
+  const runtimeTerms = credible.filter(c => (c.kind === "xterm" || c.kind === "guac") && c.confidence >= 80);
+  const pool = runtimeTerms.length > 0 ? runtimeTerms : credible;
+
+  pool.sort((a, b) => {
+    const diffWeight = getKindWeight(b.kind) - getKindWeight(a.kind);
+    if (diffWeight !== 0) return diffWeight;
+    return b.confidence - a.confidence;
+  });
+
+  if (pool.length > 1 && pool[0].kind === pool[1].kind && pool[0].confidence - pool[1].confidence < 15) {
+    return {
+      selected: null,
+      candidates,
+      error: `发现多个同等可信的终端候选：${pool.map(c => `${c.candidateId} ${c.selector} (${c.confidence}%)`).join("；")}`
+    };
+  }
+
+  return { selected: pool[0], candidates, error: "" };
+}
+
 // ─── MAIN 世界通用 Web 终端 (Xterm / Guacamole / 云堡垒机 / JumpServer / DOPS / K8s / 任意自研终端) 注入函数 ───
-async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null, discoverOnly = false, targetCandidateKind = null) {
+async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null, discoverOnly = false, targetCandidateKind = null, interactiveOptions = null) {
   try {
     const frameElement = window.frameElement;
     if (frameElement) {
@@ -993,6 +1119,116 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
       }
     }
     return -1;
+  }
+
+  function parseKeySequence(str) {
+    if (!str) return "";
+    const KEY_MAP = {
+      "<enter>": "\r",
+      "<cr>": "\r",
+      "<return>": "\r",
+      "<esc>": "\x1b",
+      "<escape>": "\x1b",
+      "<tab>": "\t",
+      "<backspace>": "\x7f",
+      "<bs>": "\x7f",
+      "<delete>": "\x1b[3~",
+      "<del>": "\x1b[3~",
+      "<up>": "\x1b[A",
+      "<down>": "\x1b[B",
+      "<right>": "\x1b[C",
+      "<left>": "\x1b[D",
+      "<home>": "\x1b[H",
+      "<end>": "\x1b[F",
+      "<pageup>": "\x1b[5~",
+      "<pgup>": "\x1b[5~",
+      "<pagedown>": "\x1b[6~",
+      "<pgdn>": "\x1b[6~",
+      "<space>": " ",
+      "<f1>": "\x1bOP",
+      "<f2>": "\x1bOQ",
+      "<f3>": "\x1bOR",
+      "<f4>": "\x1bOS",
+      "<f5>": "\x1b[15~",
+      "<f6>": "\x1b[17~",
+      "<f7>": "\x1b[18~",
+      "<f8>": "\x1b[19~",
+      "<f9>": "\x1b[20~",
+      "<f10>": "\x1b[21~",
+      "<f11>": "\x1b[23~",
+      "<f12>": "\x1b[24~",
+    };
+
+    let result = "";
+    let i = 0;
+    while (i < str.length) {
+      if (str[i] === "<") {
+        const endIdx = str.indexOf(">", i);
+        if (endIdx !== -1) {
+          const token = str.slice(i, endIdx + 1);
+          const lowerToken = token.toLowerCase();
+          if (KEY_MAP[lowerToken]) {
+            result += KEY_MAP[lowerToken];
+            i = endIdx + 1;
+            continue;
+          }
+          // 支持 <ctrl-c>, <ctrl+c>, <ctrl-d>, <ctrl-z>, <ctrl-[> 等
+          const ctrlMatch = lowerToken.match(/^<ctrl[-+]([a-z@\[\\\]^_])>$/);
+          if (ctrlMatch) {
+            const char = ctrlMatch[1];
+            let code = 0;
+            if (char >= 'a' && char <= 'z') {
+              code = char.charCodeAt(0) - 96; // 'a' 为 1
+            } else if (char === '@') code = 0;
+            else if (char === '[') code = 27; // Esc
+            else if (char === '\\') code = 28;
+            else if (char === ']') code = 29;
+            else if (char === '^') code = 30;
+            else if (char === '_') code = 31;
+            result += String.fromCharCode(code);
+            i = endIdx + 1;
+            continue;
+          }
+        }
+      }
+      result += str[i];
+      i++;
+    }
+    return result;
+  }
+
+  function getXtermScreen(term) {
+    const buf = term.buffer.active;
+    const cols = term.cols || 80;
+    const rows = term.rows || 24;
+    const cursorX = buf.cursorX !== undefined ? buf.cursorX : 0;
+    const cursorY = buf.cursorY !== undefined ? buf.cursorY : 0;
+    const bufferType = buf.type || (term.buffer.normal === buf ? "normal" : "alternate");
+    const viewportY = buf.viewportY !== undefined ? buf.viewportY : Math.max(0, buf.baseY);
+
+    const lines = [];
+    for (let y = 0; y < rows; y++) {
+      const line = buf.getLine(viewportY + y);
+      lines.push(line ? line.translateToString(true) : "");
+    }
+
+    return {
+      cols,
+      rows,
+      cursor: { x: cursorX, y: cursorY },
+      bufferType,
+      screen: lines.join("\n")
+    };
+  }
+
+  function sendRawToXterm(term, rawBytes) {
+    if (term._core?.coreService?.triggerDataEvent) {
+      term._core.coreService.triggerDataEvent(rawBytes, true);
+    } else if (typeof term.input === "function") {
+      term.input(rawBytes);
+    } else if (typeof term.paste === "function") {
+      term.paste(rawBytes);
+    }
   }
 
   // 1. 过滤掉 <symbol id="icon-yab_h_terminal"> 等 SVG 图标元素，避免假阳性
@@ -1201,6 +1437,47 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
     }
     const initialPrompt = (extractLogicalLines(activeBuf, startRow, activeBuf.baseY + activeBuf.cursorY)[0] || "").trim();
 
+    // ─── 交互模式分流处理 (screen / key / start) ───
+    if (interactiveOptions && interactiveOptions.mode === "screen") {
+      const info = getXtermScreen(term);
+      return {
+        matched: true,
+        tier: 1,
+        ok: true,
+        ...info
+      };
+    }
+
+    if (interactiveOptions && interactiveOptions.mode === "key") {
+      const rawBytes = parseKeySequence(interactiveOptions.keys || "");
+      sendRawToXterm(term, rawBytes);
+      const settleMs = interactiveOptions.settleMs || 150;
+      await new Promise(r => setTimeout(r, settleMs));
+      const info = getXtermScreen(term);
+      return {
+        matched: true,
+        tier: 1,
+        ok: true,
+        sentKeys: interactiveOptions.keys,
+        ...info
+      };
+    }
+
+    if (interactiveOptions && interactiveOptions.mode === "start") {
+      const cleanCmd = (cmd || "").replace(/[\r\n]+$/, "");
+      sendRawToXterm(term, `${cleanCmd}\r`);
+      const settleMs = interactiveOptions.settleMs || 800;
+      await new Promise(r => setTimeout(r, settleMs));
+      const info = getXtermScreen(term);
+      return {
+        matched: true,
+        tier: 1,
+        ok: true,
+        cmd: cleanCmd,
+        ...info
+      };
+    }
+
     return new Promise((resolve) => {
       let writeDisposable = null;
       let trimDisposable = null;
@@ -1252,11 +1529,24 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
         const lines = extractLogicalLines(buf, Math.max(0, startRow - 5), curY);
         const partial = lines.join("\n");
         cleanup();
+
+        let diagnostic = "";
+        const lastLine = lines.length ? (lines[lines.length - 1] || "").trim() : "";
+        const isAlt = buf.type === "alternate" || (term.buffer.normal && term.buffer.normal !== buf);
+
+        if (isAlt) {
+          diagnostic = "\n\n[终端诊断] 检测到终端已进入全屏 TUI 交互模式 (Alternate Buffer，如 k9s/vim/top/less)！\n提示：该程序仍在后台持续运行中。请使用 `bctl screen` 查看当前全屏画面，使用 `bctl key` 发送交互按键（如 `bctl key ':q<Enter>'` 或 `bctl key '<Ctrl-C>'` 退出）。";
+        } else if (/(?:>|quote>|dquote>|subshell>|heredoc>)$/.test(lastLine)) {
+          diagnostic = `\n\n[终端诊断] 检测到终端处于多行输入未闭合状态 (末尾提示符为 '${lastLine}')！\n大模型注意：上一条命令可能存在未闭合的 EOF、单双引号或多行输入语法。请勿盲目继续发送普通命令！建议先执行 \`bctl key '<Ctrl-C>'\` 强制中断退出未完成的多行输入。`;
+        } else if (isInteractivePrompt(lastLine)) {
+          diagnostic = `\n\n[终端诊断] 检测到终端正在等待交互式凭证或输入确认 (末尾提示符为 '${lastLine}')。\n提示：请使用 \`bctl key '${lastLine.includes("yes/no") ? "yes<Enter>" : "<输入内容><Enter>"}'\` 发送交互数据。`;
+        }
+
         resolve({
           matched: true,
           tier: 1,
           ok: false,
-          error: `指令在 ${timeoutMs}ms 内未执行完（可能卡在交互式输入或耗时命令）`,
+          error: `指令在 ${timeoutMs}ms 内未执行完（可能卡在交互式输入或耗时命令）${diagnostic}`,
           partialOutput: partial.slice(-2000),
         });
       }, timeoutMs);
@@ -1500,6 +1790,52 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
     const initialPrompt = (beforeLines[beforeLines.length - 1] || "").trim();
     const wasInteractive = isInteractivePrompt(initialPrompt);
 
+    if (interactiveOptions && interactiveOptions.mode === "screen") {
+      return {
+        matched: true,
+        tier: 1,
+        ok: true,
+        cols: 80,
+        rows: beforeLines.length,
+        cursor: { x: 0, y: Math.max(0, beforeLines.length - 1) },
+        bufferType: "guac",
+        screen: beforeLines.join("\n")
+      };
+    }
+
+    if (interactiveOptions && (interactiveOptions.mode === "key" || interactiveOptions.mode === "start")) {
+      const keysToSend = interactiveOptions.mode === "key"
+        ? parseKeySequence(interactiveOptions.keys || "")
+        : `${(cmd || "").replace(/[\r\n]+$/, "")}\r`;
+      const toKeysym = (cp) => {
+        if (cp === 10 || cp === 13) return 65293;
+        if (cp <= 31 || (cp >= 127 && cp <= 159)) return 65280 | cp;
+        if (cp >= 0 && cp <= 255) return cp;
+        if (cp >= 256 && cp <= 1114111) return 16777216 | cp;
+        return null;
+      };
+      for (const ch of keysToSend) {
+        const ks = toKeysym(ch.codePointAt(0));
+        if (ks !== null) {
+          client.sendKeyEvent(1, ks);
+          client.sendKeyEvent(0, ks);
+        }
+      }
+      const settleMs = interactiveOptions.settleMs || 300;
+      await new Promise(r => setTimeout(r, settleMs));
+      const afterLines = await readGuacScreenLines();
+      return {
+        matched: true,
+        tier: 1,
+        ok: true,
+        cols: 80,
+        rows: afterLines.length,
+        cursor: { x: 0, y: Math.max(0, afterLines.length - 1) },
+        bufferType: "guac",
+        screen: afterLines.join("\n")
+      };
+    }
+
     sendGuacCommand(cleanCmd);
 
     return new Promise((resolve) => {
@@ -1697,6 +2033,42 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
     universalTarget = credible[0] || null;
   }
   if (!universalTarget) return { matched: false, candidates: publicCandidates };
+
+  if (interactiveOptions && interactiveOptions.mode === "screen") {
+    const el = universalTarget.element;
+    const text = el.value !== undefined ? el.value : (el.innerText || "");
+    return {
+      matched: true,
+      tier: 2,
+      ok: true,
+      cols: 80,
+      rows: text.split("\n").length,
+      cursor: { x: 0, y: 0 },
+      bufferType: "generic",
+      screen: text
+    };
+  }
+
+  if (interactiveOptions && (interactiveOptions.mode === "key" || interactiveOptions.mode === "start")) {
+    const textToSend = interactiveOptions.mode === "key"
+      ? parseKeySequence(interactiveOptions.keys || "")
+      : `${(cmd || "").replace(/[\r\n]+$/, "")}\n`;
+    dispatchUniversalTerminalInput(universalTarget.element, textToSend);
+    const settleMs = interactiveOptions.settleMs || 200;
+    await new Promise(r => setTimeout(r, settleMs));
+    const el = universalTarget.element;
+    const text = el.value !== undefined ? el.value : (el.innerText || "");
+    return {
+      matched: true,
+      tier: 2,
+      ok: true,
+      cols: 80,
+      rows: text.split("\n").length,
+      cursor: { x: 0, y: 0 },
+      bufferType: "generic",
+      screen: text
+    };
+  }
 
   function dispatchUniversalTerminalInput(targetEl, commandText) {
     const val = targetEl.value || "";

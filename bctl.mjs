@@ -153,6 +153,27 @@ async function sendCommand(action, payload = {}, retries = 1) {
   }
 }
 
+function formatTerminalScreen(result) {
+  if (!result || typeof result !== "object") {
+    console.log(result);
+    return;
+  }
+  if (!result.ok && result.error) {
+    console.error(`[终端错误] ${result.error}`);
+    return;
+  }
+  const cols = result.cols || "?";
+  const rows = result.rows || "?";
+  const curX = result.cursor ? result.cursor.x : "?";
+  const curY = result.cursor ? result.cursor.y : "?";
+  const bufType = result.bufferType || "normal";
+  const actionSummary = result.sentKeys ? ` (按键: ${result.sentKeys})` : result.cmd ? ` (启动: ${result.cmd})` : "";
+  console.log(`[Terminal Screen${actionSummary}] ${cols}x${rows} | 光标: (${curX}, ${curY}) | 缓冲: ${bufType}`);
+  console.log("--------------------------------------------------------------------------------");
+  console.log(result.screen || "(屏幕内容为空)");
+  console.log("--------------------------------------------------------------------------------");
+}
+
 // --- 3. 命令行入口 ---
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -171,6 +192,9 @@ bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及
   bctl switch <IP|序号>    在当前页面一键切换到指定的内嵌终端标签页 (不重新打开)
   bctl connect <IP> [--new] 智能连接主机 (优先复用已连接终端，断开自动重连，支持 --new 强制新开)
   bctl exec [--target frameId:index] "<shell命令>"  在已识别的 Web 终端中执行命令
+  bctl screen [--target frameId:index] [--json]     获取 Web 终端当前可视屏幕文本网格与光标位置
+  bctl key [--target frameId:index] "<按键序列>"   向 Web 终端发送交互按键 (如 <Ctrl-C>, <Up>, :pods<Enter>)
+  bctl start [--target frameId:index] "<交互命令>" 启动交互式 TUI 程序 (如 k9s, top, vim)，不等待退出并返回首屏
   bctl devtools "<查询>"   在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器中填充并执行查询
   bctl probe               一键嗅探当前页面所有就绪终端、编辑器 (Monaco / Ace / CodeMirror) 与表单
   bctl look                静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要
@@ -267,6 +291,78 @@ if (cmd === "daemon") {
   }
   const result = await sendCommand("term_exec", { cmd: commandToRun, timeoutMs: 20000, candidateTarget });
   console.log(result);
+} else if (cmd === "screen" || cmd === "term-screen") {
+  let commandArgs = args.slice(1);
+  let candidateTarget = null;
+  const isJson = commandArgs.includes("--json");
+  commandArgs = commandArgs.filter(a => a !== "--json");
+  if (commandArgs[0] === "--target") {
+    const target = commandArgs[1] || "";
+    const match = target.match(/^(\d+):(\d+)$/);
+    if (!match) {
+      console.error("用法: bctl screen [--target <frameId>:<候选序号>] [--json]");
+      process.exit(1);
+    }
+    candidateTarget = { frameId: Number(match[1]), index: Number(match[2]) };
+  }
+  const result = await sendCommand("term_screen", { candidateTarget });
+  if (isJson || typeof result !== "object") {
+    console.log(typeof result === "object" ? JSON.stringify(result, null, 2) : result);
+  } else {
+    formatTerminalScreen(result);
+  }
+} else if (cmd === "key" || cmd === "term-key") {
+  let commandArgs = args.slice(1);
+  let candidateTarget = null;
+  const isJson = commandArgs.includes("--json");
+  commandArgs = commandArgs.filter(a => a !== "--json");
+  if (commandArgs[0] === "--target") {
+    const target = commandArgs[1] || "";
+    const match = target.match(/^(\d+):(\d+)$/);
+    if (!match) {
+      console.error("用法: bctl key [--target <frameId>:<候选序号>] [--json] '<按键序列>'");
+      process.exit(1);
+    }
+    candidateTarget = { frameId: Number(match[1]), index: Number(match[2]) };
+    commandArgs = commandArgs.slice(2);
+  }
+  const keySequence = commandArgs.join(" ");
+  if (!keySequence) {
+    console.error("用法: bctl key [--target <frameId>:<候选序号>] '<按键序列，如 <Ctrl-C>、<Up>、:pods<Enter>>'");
+    process.exit(1);
+  }
+  const result = await sendCommand("term_key", { keys: keySequence, candidateTarget, settleMs: 150 });
+  if (isJson || typeof result !== "object") {
+    console.log(typeof result === "object" ? JSON.stringify(result, null, 2) : result);
+  } else {
+    formatTerminalScreen(result);
+  }
+} else if (cmd === "start" || cmd === "term-start" || cmd === "term-run") {
+  let commandArgs = args.slice(1);
+  let candidateTarget = null;
+  const isJson = commandArgs.includes("--json");
+  commandArgs = commandArgs.filter(a => a !== "--json");
+  if (commandArgs[0] === "--target") {
+    const target = commandArgs[1] || "";
+    const match = target.match(/^(\d+):(\d+)$/);
+    if (!match) {
+      console.error("用法: bctl start [--target <frameId>:<候选序号>] [--json] '<交互命令>'");
+      process.exit(1);
+    }
+    candidateTarget = { frameId: Number(match[1]), index: Number(match[2]) };
+    commandArgs = commandArgs.slice(2);
+  }
+  const commandToRun = commandArgs.join(" ");
+  if (!commandToRun) {
+    console.error("用法: bctl start [--target <frameId>:<候选序号>] '<交互命令，如 k9s、top、vim>'");
+    process.exit(1);
+  }
+  const result = await sendCommand("term_start", { cmd: commandToRun, candidateTarget, settleMs: 800 });
+  if (isJson || typeof result !== "object") {
+    console.log(typeof result === "object" ? JSON.stringify(result, null, 2) : result);
+  } else {
+    formatTerminalScreen(result);
+  }
 } else if (cmd === "devtools" || cmd === "query" || cmd === "console") {
   const queryToRun = args.slice(1).join(" ");
   if (!queryToRun) {

@@ -1,6 +1,6 @@
 ---
 name: chrome-control
-description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复用现有 Cookie 与登录态、后台标签页并发操作），支持各类 Web 终端（JumpServer、DOPS、K8s 容器终端、自研 Xterm 终端）直连执行命令，以及 Kibana DevTools / 自研代码编辑器（Monaco/Ace/CodeMirror）查询执行。当用户需要操作网页、查询内部后台、在各类 Web 终端执行命令或在 DevTools/代码编辑器中运行查询时使用。
+description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复用现有 Cookie 与登录态、后台标签页并发操作），支持各类 Web 终端（JumpServer、DOPS、K8s 容器终端、自研 Xterm 终端）直连执行命令与全屏交互式 TUI 程序（k9s、top、vim、按键流与 EOF 止血），以及 Kibana DevTools / 自研代码编辑器（Monaco/Ace/CodeMirror）查询执行。当用户需要操作网页、查询内部后台、在各类 Web 终端执行命令、运行 TUI 交互程序或在 DevTools/代码编辑器中运行查询时使用。
 ---
 
 # Chrome 浏览器控制 (bctl)
@@ -24,6 +24,9 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 | `bctl connect <IP> [--new]` | 智能按需连接（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
 | `bctl probe` | 跨 frame 列出终端候选、定位证据、置信度，以及 Monaco/Ace/CodeMirror 编辑器 |
 | `bctl exec [--target frameId:index] '<shell命令>'` | 在已识别的 Web 终端执行命令；目标不唯一时先从 probe 结果中选择 |
+| `bctl screen [--target frameId:index]` | 获取 Web 终端当前可视屏幕文本网格、光标位置与缓冲类型（用于观察 TUI 界面或多行输入状态） |
+| `bctl key [--target frameId:index] '<按键序列>'` | 向 Web 终端发送交互按键（如 `<Ctrl-C>` 止血、`<Up>`/`<Down>` 导航、`<Enter>`、`<Esc>`、`:pods<Enter>`） |
+| `bctl start [--target frameId:index] '<交互命令>'` | 启动 TUI 交互式程序（如 `k9s`、`top`、`vim`），不傻等退出，立即捕获并返回首屏画面 |
 | `bctl devtools "<查询>"` | 在绑定的 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |
 | `bctl look` | 扫描当前视口可交互元素与可见表格/指标数据，返回 `[0]`, `[1]`... 编号摘要 |
 | `bctl act '<JSON数组>'` | 执行交互动作并返回最新页面摘要 |
@@ -67,6 +70,16 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 - 自动执行仅在唯一候选达到置信度门槛时发生。若返回多个候选，按 `candidateId` 明确指定，例如 `bctl exec --target 12:0 'uname -a'`。若没有足够证据，命令不会发送；检查 `probe` 输出后再指定候选。
 - 纯像素 Canvas 若未暴露可访问名称、可聚焦键盘面或 DOM 输入节点，浏览器扩展无法像人一样理解画面；这需要页面自身提供可访问语义或单独适配。未能读取命令回显时，bctl 会报告结果未知；先查看终端状态，不要盲目重放命令。
 - 对可识别的 Xterm 和 Guacamole 页面，bctl 仍使用对应运行时接口提升输入和回显准确度；这些优化不会改变通用候选选择流程。
+
+### 2.5 交互式 TUI 命令与多行未闭合止血 (`bctl start` / `bctl screen` / `bctl key`)
+- **运行 k9s / top / vim 等全屏 TUI 程序**：
+  - **严禁用 `bctl exec` 启动 TUI 程序**（因为 TUI 程序无主提示符，会死等 20 秒触发超时）。
+  - 使用 `bctl start '<命令>'` 启动（如 `bctl start 'k9s'`），它会立即捕获并返回全屏字符网格。
+  - 使用 `bctl key '<按键>'` 执行交互动作（如 `bctl key ':pods<Enter>'` 切视图、`bctl key '<Down><Down>l'` 查日志、`bctl key '<Esc>'` 返回、`bctl key ':q<Enter>'` 退出）。
+  - 需要单独检查终端当前可见画面时，随时调用 `bctl screen`。
+- **多行输入 (EOF / 引号) 卡死与止血**：
+  - 若 `bctl exec` 报错提示 `检测到终端处于多行输入未闭合状态` 或终端末尾显示 `>`：**严禁继续盲目发送 `echo` 等普通命令**（文本会被当作输入内容吃掉）。
+  - **立即执行 `bctl key '<Ctrl-C>'`** 强行中断未完成的多行输入，一秒恢复 Shell 提示符后再继续操作。
 
 ### 3. Kibana DevTools 与代码编辑器查询 (`bctl devtools`)
 - 支持 Kibana DevTools、自研 ES 查询平台、Monaco Editor、Ace Editor 与 CodeMirror。

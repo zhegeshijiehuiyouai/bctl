@@ -26,6 +26,9 @@
 - **⚡ 多类型 Web 终端发现与命令执行 (`bctl probe` / `bctl exec`)**：
   - 优先使用终端公开的输入/输出接口；其它页面根据可访问名称、可见提示符、焦点和输入控件结构形成候选。`probe` 返回候选 frame、编号、证据和置信度；只有目标唯一且证据充分时，`exec` 才会自动发送命令。无法唯一判断时，可用 `--target` 选择。
   - 能否覆盖新终端取决于页面是否暴露可读 DOM 或键盘输入节点。只绘制像素、没有可访问名称和输入节点的画布，浏览器扩展无法可靠判断画面里哪个位置是命令行；这类页面需要针对其公开接口做适配。
+- **🖥️ 全屏 TUI 交互式程序与按键注入 (`bctl start` / `bctl screen` / `bctl key`)**：
+  - **支持 k9s / top / vim / less 全屏字符界面**：突破传统 Web 终端单次命令回显限制，支持 `bctl start` 启动全屏程序，`bctl screen` 抓取视口字符网格与光标位置，`bctl key` 发送 VT100/ANSI 物理级键盘转义序列（方向键、Esc、Ctrl+C、组合键）；
+  - **多行未闭合（EOF/引号）智能诊断与一键止血**：当命令卡在 PS2 提示符（`>`）时，自动给出结构化诊断提示，告别大模型盲目 `echo` 重试，一键 `<Ctrl-C>` 恢复正常 Shell。
 - **🔍 智能页面环境嗅探与 DevTools 直连 (`bctl probe` / `bctl devtools`)**：
   - 一键嗅探页面当前就绪的终端、Monaco / Ace / CodeMirror 代码编辑器与主表单；
   - 穿透 Kibana DevTools 与自研 ES 控制台，自动注入查询语句并模拟触发原生快捷键提交，毫秒级抓取响应输出。
@@ -165,6 +168,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 | **智能按需连接** | `bctl connect <IP> [--new]` | 智能按需连接主机（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
 | **页面环境嗅探** | `bctl probe` | 跨 frame 列出终端候选、定位证据、置信度，以及 Monaco/Ace/CodeMirror 编辑器 |
 | **Web 终端执行** | `bctl exec 'uname -a'` | 目标明确时自动选择终端；候选不唯一时，用 `bctl exec --target <frameId>:<候选序号> 'uname -a'` 指定 |
+| **终端屏幕快照** | `bctl screen` | 读取终端当前可视字符网格、光标位置与缓冲模式（用于 TUI 交互或多行状态诊断） |
+| **发送交互按键** | `bctl key '<按键序列>'` | 向终端发送离散按键与转义码（支持 `<Ctrl-C>`、`<Up>`、`<Down>`、`<Enter>`、`<Esc>`、`:pods<Enter>`） |
+| **启动交互式程序** | `bctl start 'k9s'` | 启动 `k9s`、`top`、`vim` 等 TUI 交互程序，不等待退出直接捕获首屏并移交控制权 |
 | **DevTools 执行** | `bctl devtools "GET _cat/indices?v"` | 在 Kibana DevTools / 自研 ES 控制台 / 代码编辑器填充并执行查询 |
 | **感知视口元素** | `bctl look` | 静默感知当前页面所有可交互元素与可见数据，返回紧凑索引摘要（不再渲染数字角标） |
 | **执行鼠标/键盘动作** | `bctl act '<JSON动作数组>'` | 执行点击、输入、按键、智能容器滚动（实时在顶部胶囊打印具体动作） |
@@ -238,6 +244,25 @@ bctl exec --target 0:0 'ls -la /app'
 # 在 Kibana DevTools / 自研 ES 控制台执行 DSL 查询
 bctl devtools "GET _cat/indices?v"
 bctl devtools 'GET k8s-logs-*/_search\n{"size":5,"query":{"match_all":{}}}'
+```
+
+### 场景五：Web 终端交互式操作 k9s 全屏字符界面与 EOF 一键止血
+```bash
+# 1. 绑定 JumpServer 或容器终端
+bctl bind 12345
+
+# 2. 启动 k9s，捕获首屏全屏网格
+bctl start 'k9s'
+
+# 3. 按键交互：切换命名空间、选择 Pod、查看 YAML
+bctl key '4'                 # 切换命名空间
+bctl key '<Down><Down>y'     # 下移光标并按 y 查看 Pod YAML
+bctl key '/resources<Enter>' # 在 YAML 中搜索字段
+bctl key '<Esc>'             # 退出搜索与 YAML
+bctl key ':q<Enter>'         # 退出 k9s 回到 bash
+
+# 4. 若大模型写错 EOF 卡在多行输入 '>' 时，一键物理级止血
+bctl key '<Ctrl-C>'
 ```
 
 ---
