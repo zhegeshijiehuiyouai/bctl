@@ -92,14 +92,22 @@ cd bctl
 npm install
 ```
 
-### 2. 配置全局软链接
-将 `bctl.mjs` 软链接至系统的可执行路径（如 `~/.local/bin` 或 `/usr/local/bin`）：
+### 2. 配置全局命令
+
+macOS / Linux：把 `bctl.mjs` 软链接到 `PATH` 中的目录。
+
 ```bash
 mkdir -p ~/.local/bin
 ln -sf $(pwd)/bctl.mjs ~/.local/bin/bctl
 
 # 确保 ~/.local/bin 在 PATH 环境变量中（一般在 ~/.zshrc 中）
 # export PATH="$HOME/.local/bin:$PATH"
+```
+
+Windows：不要用 `bctl.cmd` 加 `%*` 做转发。cmd 会把参数再解析一次，引号里的 `|`、`<`、`>` 会在本机被拆开，到不了远端终端。安装脚本用自带的 `csc.exe` 编译 `bctl.exe`，由它把参数数组直接交给 `node.exe`，并放到 `%APPDATA%\npm`（需要该目录已在 `PATH` 中）。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1
 ```
 
 ### 3. 在 Chrome 中加载扩展
@@ -134,9 +142,10 @@ macOS / Linux：
 bash scripts/install-skill.sh
 ```
 
-Windows（PowerShell，目录联接不需要管理员）：
+Windows（PowerShell，目录联接不需要管理员）。CLI 须先按上一节装成 `bctl.exe`，技能文件里写的也是这一步：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
 ```
 

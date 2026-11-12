@@ -7,6 +7,18 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 
 使用全局 CLI `bctl` 在后台标签页驱动用户正在使用的 Chrome，复用当前 Cookie 与登录态，不抢占前台焦点。
 
+## Windows 安装
+
+在 Windows 上，`bctl` 必须是 `%APPDATA%\npm\bctl.exe`，不能是 `bctl.cmd`。`.cmd` 用 `%*` 转发时，cmd 会把参数再解析一次，引号里的 `|`、`<`、`>` 会在本机被拆开。
+
+本机没有 `bctl`，或 `Get-Command bctl` 的路径不是 `bctl.exe` 时，在仓库根目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1
+```
+
+脚本用系统自带的 `csc.exe` 编译 `scripts\bctl-launch.cs`，生成 `bctl.exe`，由它把参数数组直接交给 `node.exe`。不要另写 `bctl.cmd`、批处理或 `cmd /c` 包装。macOS / Linux 仍用 `bctl.mjs` 的软链接，不编译这个启动器。
+
 ## 工作流与命令速查
 
 1. **打开新页面**：用 `bctl new "<url>"` 在后台新建并自动绑定标签页。
