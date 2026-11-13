@@ -43,5 +43,4 @@ foreach ($dir in $targets) {
 }
 
 Write-Output "安装完成。新开一轮 Agent 对话后，操作浏览器或 JumpServer 终端时会加载 chrome-control。"
-Write-Output "Windows 上还要安装 CLI：powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1"
-Write-Output "该脚本编译 scripts\bctl-launch.cs，生成 %APPDATA%\npm\bctl.exe。不要改用 bctl.cmd。"
+Write-Output "Windows 上还要安装 CLI（仅 PowerShell 7）：pwsh -NoProfile -File .\scripts\install-cli.ps1"

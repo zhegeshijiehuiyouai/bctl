@@ -9,15 +9,15 @@ description: 通过 bctl CLI 控制用户当前运行的 Chrome 浏览器（复�
 
 ## Windows 安装
 
-在 Windows 上，`bctl` 必须是 `%APPDATA%\npm\bctl.exe`，不能是 `bctl.cmd`。`.cmd` 用 `%*` 转发时，cmd 会把参数再解析一次，引号里的 `|`、`<`、`>` 会在本机被拆开。
+Windows 上 `bctl` 只支持 PowerShell 7（`pwsh`）：5.1 会把参数里的引号吞掉，JSON 参数（如 `{"type":"click","id":1}`）会被破坏。不要用 `powershell.exe` 调用，也不要用 `bctl.cmd`、批处理或 `cmd /c` 包装，`.cmd` 会被 cmd.exe 再解析一次。
 
-本机没有 `bctl`，或 `Get-Command bctl` 的路径不是 `bctl.exe` 时，在仓库根目录执行：
+`Get-Command bctl` 找不到时，在仓库根目录执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1
+pwsh -NoProfile -File .\scripts\install-cli.ps1
 ```
 
-脚本用系统自带的 `csc.exe` 编译 `scripts\bctl-launch.cs`，生成 `bctl.exe`，由它把参数数组直接交给 `node.exe`。不要另写 `bctl.cmd`、批处理或 `cmd /c` 包装。macOS / Linux 仍用 `bctl.mjs` 的软链接，不编译这个启动器。
+脚本在 `%APPDATA%\npm` 生成 `bctl.ps1`，由它把参数数组原样交给 `node.exe`。macOS / Linux 仍用 `bctl.mjs` 的软链接。
 
 ## 工作流与命令速查
 

@@ -50,7 +50,7 @@
 ## 🛠️ 系统架构与依赖
 
 ### 运行依赖
-- **操作系统**：macOS / Linux / Windows
+- **操作系统**：macOS / Linux / Windows（Windows 仅支持 PowerShell 7，即 `pwsh`）
 - **运行时**：Node.js >= 18.0.0
 - **浏览器**：Google Chrome 或其他基于 Chromium 的现代浏览器
 - **Node 依赖**：`ws`（WebSocket 协议支持）
@@ -104,10 +104,10 @@ ln -sf $(pwd)/bctl.mjs ~/.local/bin/bctl
 # export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Windows：不要用 `bctl.cmd` 加 `%*` 做转发。cmd 会把参数再解析一次，引号里的 `|`、`<`、`>` 会在本机被拆开，到不了远端终端。安装脚本用自带的 `csc.exe` 编译 `bctl.exe`，由它把参数数组直接交给 `node.exe`，并放到 `%APPDATA%\npm`（需要该目录已在 `PATH` 中）。
+Windows：仅支持 PowerShell 7（`pwsh`）。PowerShell 5.1 会吞掉参数里的引号（例如 `{"type":"click","id":1}` 会变成 `{type:click,id:1}`），bctl 不做 5.1 兼容。安装脚本会在 `%APPDATA%\npm` 生成 `bctl.ps1` 转发脚本（该目录需已在 `PATH` 中），由它把参数数组原样交给 `node.exe`：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1
+pwsh -NoProfile -File .\scripts\install-cli.ps1
 ```
 
 ### 3. 在 Chrome 中加载扩展
@@ -142,11 +142,11 @@ macOS / Linux：
 bash scripts/install-skill.sh
 ```
 
-Windows（PowerShell，目录联接不需要管理员）。CLI 须先按上一节装成 `bctl.exe`，技能文件里写的也是这一步：
+Windows（PowerShell 7，目录联接不需要管理员）。CLI 先按上一节装好：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-cli.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\install-skill.ps1
+pwsh -NoProfile -File .\scripts\install-cli.ps1
+pwsh -NoProfile -File .\scripts\install-skill.ps1
 ```
 
 脚本会把 `skills/chrome-control` 链到下面这些目录。Claude Code 或 Gemini 的 `skills` 目录如果已经整体指向 `~/.agents/skills`，对应的那一次链接和共用目录是同一个位置。
