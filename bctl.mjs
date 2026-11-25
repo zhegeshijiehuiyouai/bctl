@@ -5,10 +5,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { resolveClientSession } from "./lib/client-session.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const BCTL_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version;
 
 const WS_PORT = 9223;
 const HTTP_PORT = 9224;
@@ -32,10 +34,24 @@ function startDaemon() {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.type === "pong") return; // 扩展心跳包
+        if (msg.type === "hello") {
+          ws.bctlVersion = typeof msg.version === "string" ? msg.version : null;
+          return;
+        }
         if (msg.id && pendingRequests.has(msg.id)) {
-          const { resolve } = pendingRequests.get(msg.id);
+          const pending = pendingRequests.get(msg.id);
+          if (pending.socket !== ws) return;
+          if (msg.type === "started") {
+            pending.started = true;
+            return;
+          }
+          clearTimeout(pending.timer);
           pendingRequests.delete(msg.id);
-          resolve(msg.result);
+          if (msg.error) {
+            pending.reject(Object.assign(new Error(msg.error), { code: msg.code }));
+          } else {
+            pending.resolve(msg.result);
+          }
         }
       } catch (e) {
         console.error("[bctl] 消息解析异常:", e);
@@ -44,6 +60,12 @@ function startDaemon() {
 
     ws.on("close", () => {
       if (activeSocket === ws) activeSocket = null;
+      for (const [id, pending] of pendingRequests) {
+        if (pending.socket !== ws) continue;
+        clearTimeout(pending.timer);
+        pendingRequests.delete(id);
+        pending.reject(Object.assign(new Error("Chrome 扩展连接已断开，已下发操作的结果未知；请先检查页面或终端状态"), { code: "BCTL_RESULT_UNKNOWN" }));
+      }
       console.log("[bctl] Chrome 扩展连接已断开");
     });
   });
@@ -70,7 +92,9 @@ function startDaemon() {
     if (url.pathname === "/status") {
       res.end(JSON.stringify({
         daemon: true,
-        extension_connected: !!activeSocket && activeSocket.readyState === 1
+        version: BCTL_VERSION,
+        extension_connected: !!activeSocket && activeSocket.readyState === 1,
+        extension_version: activeSocket?.bctlVersion || null
       }));
       return;
     }
@@ -89,25 +113,42 @@ function startDaemon() {
         if (body) payload = JSON.parse(body);
 
         let action = url.pathname.replace(/^\//, "");
-        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        const timeoutLimit = payload.timeoutMs ? payload.timeoutMs + 3000 : 25000;
+        const id = randomUUID();
+        const socket = activeSocket;
+        if (!socket || socket.readyState !== 1) throw new Error("Chrome 扩展未连接");
+        const timeoutLimit = Number.isFinite(payload.timeoutMs) && payload.timeoutMs > 0 ? payload.timeoutMs + 3000 : 25000;
+        const expiresAt = Date.now() + timeoutLimit;
 
         const promise = new Promise((resolve, reject) => {
-          pendingRequests.set(id, { resolve, reject });
-          setTimeout(() => {
+          const pending = { resolve, reject, socket, started: false, timer: null };
+          pendingRequests.set(id, pending);
+          pending.timer = setTimeout(() => {
             if (pendingRequests.has(id)) {
               pendingRequests.delete(id);
-              reject(new Error(`操作超时（${timeoutLimit / 1000} 秒内未收到浏览器响应）`));
+              // 取消绕过扩展执行队列；expiresAt 也能在取消消息丢失时阻止过期请求。
+              try {
+                if (socket.readyState === 1) socket.send(JSON.stringify({ type: "cancel", id }));
+              } catch (_) {}
+              const detail = pending.started
+                ? "操作已经开始，结果未知；请先检查页面或终端状态"
+                : "已取消排队请求；若浏览器已开始执行，结果未知，请先检查页面或终端状态";
+              reject(Object.assign(new Error(`操作超时（${timeoutLimit / 1000} 秒内未收到浏览器响应）；${detail}`), { code: "BCTL_RESULT_UNKNOWN" }));
             }
           }, timeoutLimit);
+          try {
+            socket.send(JSON.stringify({ id, action, payload, expiresAt }));
+          } catch (err) {
+            clearTimeout(pending.timer);
+            pendingRequests.delete(id);
+            reject(err);
+          }
         });
 
-        activeSocket.send(JSON.stringify({ id, action, payload }));
         const result = await promise;
         res.end(JSON.stringify({ success: true, result }));
       } catch (err) {
         res.statusCode = 500;
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({ error: err.message, code: err.code }));
       }
     });
   });

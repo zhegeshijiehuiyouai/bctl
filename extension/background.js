@@ -30,25 +30,42 @@ function sanitizeBindings(raw) {
 }
 
 let sessionBindingsCache = null;
+let sessionBindingsLoad = null;
 let sessionBindingsChain = Promise.resolve();
 
 async function loadSessionBindings() {
   if (sessionBindingsCache) return sessionBindingsCache;
-  const stored = await chrome.storage.session.get([SESSION_BINDINGS_KEY, ...LEGACY_BINDING_KEYS]);
-  const bindings = sanitizeBindings(stored[SESSION_BINDINGS_KEY]);
-  // 兼容升级前的全局单绑定：归入默认会话，避免老标签页失联
-  if (stored.boundTabId && !bindings[DEFAULT_SESSION_ID]) {
-    bindings[DEFAULT_SESSION_ID] = {
-      tabId: Number(stored.boundTabId),
-      lastActivity: Number(stored.lastActivityTime) || Date.now()
-    };
+  if (!sessionBindingsLoad) {
+    sessionBindingsLoad = (async () => {
+      const stored = await chrome.storage.session.get([SESSION_BINDINGS_KEY, ...LEGACY_BINDING_KEYS]);
+      const bindings = sanitizeBindings(stored[SESSION_BINDINGS_KEY]);
+      // 兼容升级前的全局单绑定：归入默认会话，避免老标签页失联
+      if (stored.boundTabId && !bindings[DEFAULT_SESSION_ID]) {
+        bindings[DEFAULT_SESSION_ID] = {
+          tabId: Number(stored.boundTabId),
+          lastActivity: Number(stored.lastActivityTime) || Date.now()
+        };
+      }
+      // 清理旧版本并发绑定留下的重复归属，保留最近活跃的会话。
+      const owners = new Map();
+      for (const [sessionId, entry] of Object.entries(bindings)) {
+        const owner = owners.get(entry.tabId);
+        if (owner && bindings[owner].lastActivity > entry.lastActivity) {
+          delete bindings[sessionId];
+        } else {
+          if (owner) delete bindings[owner];
+          owners.set(entry.tabId, sessionId);
+        }
+      }
+      await chrome.storage.session.set({ [SESSION_BINDINGS_KEY]: bindings });
+      if (stored.boundTabId !== undefined || stored.lastActivityTime !== undefined) {
+        await chrome.storage.session.remove(LEGACY_BINDING_KEYS);
+      }
+      sessionBindingsCache = bindings;
+      return bindings;
+    })().finally(() => { sessionBindingsLoad = null; });
   }
-  sessionBindingsCache = bindings;
-  await chrome.storage.session.set({ [SESSION_BINDINGS_KEY]: bindings }).catch(() => {});
-  if (stored.boundTabId !== undefined || stored.lastActivityTime !== undefined) {
-    await chrome.storage.session.remove(LEGACY_BINDING_KEYS).catch(() => {});
-  }
-  return sessionBindingsCache;
+  return sessionBindingsLoad;
 }
 
 async function readSessionBindings() {
@@ -59,9 +76,10 @@ async function readSessionBindings() {
 
 async function mutateSessionBindings(mutator) {
   const run = sessionBindingsChain.then(async () => {
-    const bindings = await loadSessionBindings();
+    const bindings = { ...await loadSessionBindings() };
     const outcome = await mutator(bindings);
     await chrome.storage.session.set({ [SESSION_BINDINGS_KEY]: bindings });
+    sessionBindingsCache = bindings;
     return outcome;
   });
   sessionBindingsChain = run.catch(() => {});
@@ -82,12 +100,17 @@ async function getBindingOwner(tabId, sessionId) {
   return null;
 }
 
-async function bindSessionTab(sessionId, tabId) {
+async function bindSessionTab(sessionId, tabId, force = false) {
   return mutateSessionBindings(bindings => {
     const key = normalizeSessionId(sessionId);
+    const owner = Object.keys(bindings).find(other => other !== key && bindings[other].tabId === tabId);
+    if (owner && !force) return { ok: false, owner };
     const previousTabId = bindings[key]?.tabId ?? null;
+    for (const other of Object.keys(bindings)) {
+      if (other !== key && bindings[other].tabId === tabId) delete bindings[other];
+    }
     bindings[key] = { tabId, lastActivity: Date.now() };
-    return previousTabId;
+    return { ok: true, owner: owner || null, previousTabId };
   });
 }
 
@@ -108,17 +131,12 @@ async function touchSession(sessionId) {
 }
 
 async function takeStaleBindings(now = Date.now(), timeoutMs = CONTROL_TIMEOUT_MS) {
-  const bindings = await readSessionBindings();
-  const stale = Object.entries(bindings)
-    .filter(([, entry]) => entry.lastActivity && now - entry.lastActivity > timeoutMs)
-    .map(([sessionId, entry]) => ({ sessionId, tabId: entry.tabId }));
-  if (!stale.length) return [];
   return mutateSessionBindings(current => {
     const removed = [];
-    for (const { sessionId, tabId } of stale) {
-      if (current[sessionId]?.tabId === tabId) {
+    for (const [sessionId, entry] of Object.entries(current)) {
+      if (entry.lastActivity && now - entry.lastActivity > timeoutMs) {
         delete current[sessionId];
-        removed.push({ sessionId, tabId });
+        removed.push({ sessionId, tabId: entry.tabId });
       }
     }
     return removed;
@@ -147,18 +165,33 @@ async function listBoundTabs() {
 
 // 同一会话的命令串行执行，不同会话并行，避免同一会话内的 bind/exec 互相踩踏
 const sessionTaskQueues = new Map();
-function enqueueSessionTask(sessionId, task) {
-  const key = normalizeSessionId(sessionId);
-  const previous = sessionTaskQueues.get(key) || Promise.resolve();
+const tabTaskQueues = new Map();
+function enqueueTask(queues, key, task) {
+  const previous = queues.get(key) || Promise.resolve();
   const run = previous.then(task, task);
   const tail = run.catch(() => {});
-  sessionTaskQueues.set(key, tail);
+  queues.set(key, tail);
   tail.then(() => {
-    if (sessionTaskQueues.get(key) === tail) sessionTaskQueues.delete(key);
+    if (queues.get(key) === tail) queues.delete(key);
   });
   return run;
 }
+function enqueueSessionTask(sessionId, task) {
+  return enqueueTask(sessionTaskQueues, normalizeSessionId(sessionId), task);
+}
+function enqueueTabTask(tabId, task) {
+  return enqueueTask(tabTaskQueues, tabId, task);
+}
 // ─── 多会话绑定逻辑 (SESSION-BINDINGS END) ───
+
+async function releaseUnownedTab(tabId) {
+  if (!tabId || (await listBoundTabs()).has(tabId)) return;
+  await enqueueTabTask(tabId, async () => {
+    if ((await listBoundTabs()).has(tabId)) return;
+    await chrome.tabs.sendMessage(tabId, { action: "hide_control_state" }).catch(() => {});
+    await chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {});
+  });
+}
 
 // 1. 保活报警器（MV3 Service Worker 闲置 30 秒休眠防断连，兼顾 2 小时闲置超时兜底）
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.3 });
@@ -175,8 +208,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       const expired = await takeStaleBindings(Date.now(), CONTROL_TIMEOUT_MS);
       for (const { sessionId, tabId } of expired) {
         console.log(`[bctl] 会话 ${sessionId} 超过 2 小时无操作，触发超时兜底自动解绑标签页: ${tabId}`);
-        chrome.tabs.sendMessage(tabId, { action: "hide_control_state" }).catch(() => {});
-        await chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {});
+        await releaseUnownedTab(tabId);
       }
     } catch (_) {}
   }
@@ -209,8 +241,21 @@ async function connectWS() {
     return;
   }
 
+  const socket = ws;
+  const requests = new Map();
+  const replyError = (id, err, request) => {
+    if (!id || socket.readyState !== WebSocket.OPEN) return;
+    const unknown = request?.started && err.code === "BCTL_REQUEST_EXPIRED";
+    socket.send(JSON.stringify({
+      id,
+      error: unknown ? "请求已过期，操作可能已经执行，结果未知；请先检查页面或终端状态" : err.message,
+      code: unknown ? "BCTL_RESULT_UNKNOWN" : (err.code || "BCTL_EXTENSION_ERROR")
+    }));
+  };
+
   ws.onopen = () => {
     isConnecting = false;
+    socket.send(JSON.stringify({ type: "hello", version: chrome.runtime.getManifest().version }));
     console.log("[Extension] 成功连接至本地 bctl 守护进程");
   };
 
@@ -224,25 +269,50 @@ async function connectWS() {
     }
 
     if (msg.type === "ping") {
-      ws.send(JSON.stringify({ type: "pong" }));
+      socket.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
+    // 取消消息绕过会话队列，阻止仍在排队的请求稍后执行。
+    if (msg.type === "cancel") {
+      const request = requests.get(msg.id);
+      if (request) request.cancelled = true;
       return;
     }
 
     const sessionId = normalizeSessionId(msg.payload?.sessionId);
+    const request = { cancelled: false, started: false, expiresAt: Number.isFinite(msg.expiresAt) ? msg.expiresAt : Infinity };
+    requests.set(msg.id, request);
     // 不同会话并行执行，同一会话内串行，避免并发命令互相踩踏
-    enqueueSessionTask(sessionId, () => handleMessage(msg)).catch((err) => {
+    enqueueSessionTask(sessionId, () => handleMessage(msg, request)).catch((err) => {
       console.error("[Extension] 处理异常:", err);
-      if (msg.id) ws.send(JSON.stringify({ id: msg.id, result: `[扩展执行异常] ${err.message}` }));
-    });
+      replyError(msg.id, err, request);
+    }).finally(() => requests.delete(msg.id));
   };
 
-  const handleMessage = async (msg) => {
+  const handleMessage = async (msg, request) => {
+    const ws = socket;
+    const assertRequestActive = () => {
+      if (request.cancelled || Date.now() >= request.expiresAt || socket.readyState !== WebSocket.OPEN) {
+        const err = new Error("请求在执行前已过期或取消，操作未执行");
+        err.code = "BCTL_REQUEST_EXPIRED";
+        throw err;
+      }
+    };
+    const startRequest = () => {
+      assertRequestActive();
+      if (!request.started) {
+        request.started = true;
+        ws.send(JSON.stringify({ type: "started", id: msg.id }));
+      }
+    };
     try {
+      assertRequestActive();
       const { id, action } = msg;
       const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
       const sessionId = normalizeSessionId(payload.sessionId);
 
       if (action === "reload") {
+        startRequest();
         ws.send(JSON.stringify({ id, result: "Chrome 扩展已成功触发重载" }));
         setTimeout(() => {
           chrome.runtime.reload();
@@ -252,6 +322,7 @@ async function connectWS() {
 
       // ─── 动作 1: 列出所有标签页 (bctl tabs) ───
       if (action === "tabs") {
+        startRequest();
         const owners = await listBoundTabs();
         const allTabs = await chrome.tabs.query({});
         const lines = allTabs.map(t => {
@@ -305,8 +376,20 @@ async function connectWS() {
         }
 
         // 会话隔离：同一标签页只归属一个会话，防止两个 Agent 抢同一页面互相串台
-        const owner = await getBindingOwner(matchedTab.id, sessionId);
-        if (owner && !payload.force) {
+        const binding = await enqueueTabTask(matchedTab.id, async () => {
+          startRequest();
+          const claimed = await bindSessionTab(sessionId, matchedTab.id, payload.force === true);
+          if (!claimed.ok) return claimed;
+          await chrome.tabs.update(matchedTab.id, { autoDiscardable: false }).catch(() => {});
+          await ensureContentScript(matchedTab.id);
+          await chrome.tabs.sendMessage(matchedTab.id, {
+            action: "set_status",
+            payload: { text: "AI Agent 已接管此标签页", autoResetDelay: 2500 }
+          }).catch(() => {});
+          return claimed;
+        });
+        const { owner, previousTabId } = binding;
+        if (!binding.ok) {
           ws.send(JSON.stringify({
             id,
             result: `[会话隔离拦截] 标签页 [${matchedTab.id}] "${matchedTab.title}" 当前由会话 "${owner}" 控制。\n如需接管，请让该会话先执行 bctl unbind，或使用 bctl bind ${matchedTab.id} --force 显式抢占。`
@@ -314,20 +397,9 @@ async function connectWS() {
           return;
         }
 
-        // 保存至 session 存储，防止 Service Worker 唤醒时丢失，同时记录当前活跃时间戳
-        const previousTabId = await bindSessionTab(sessionId, matchedTab.id);
         if (previousTabId && previousTabId !== matchedTab.id) {
-          chrome.tabs.sendMessage(previousTabId, { action: "hide_control_state" }).catch(() => {});
-          await chrome.tabs.update(previousTabId, { autoDiscardable: true }).catch(() => {});
+          await releaseUnownedTab(previousTabId);
         }
-        // 禁止 Chrome 后台休眠丢弃该标签页
-        await chrome.tabs.update(matchedTab.id, { autoDiscardable: false }).catch(() => {});
-        // 激活 ChatGPT 同款中央光标与控制胶囊 + Tab 图标光标
-        await ensureContentScript(matchedTab.id);
-        chrome.tabs.sendMessage(matchedTab.id, {
-          action: "set_status",
-          payload: { text: "AI Agent 已接管此标签页", autoResetDelay: 2500 }
-        }).catch(() => {});
 
         const takeoverNote = owner ? `\n已从会话 "${owner}" 显式接管该标签页。` : "";
         ws.send(JSON.stringify({
@@ -339,32 +411,38 @@ async function connectWS() {
 
       // ─── 动作 2.5: 在后台静默打开新标签页 (bctl new <url>) ───
       if (action === "new") {
+        startRequest();
         const newTab = await chrome.tabs.create({ url: payload.url, active: false });
-        const previousTabId = await bindSessionTab(sessionId, newTab.id);
-        if (previousTabId && previousTabId !== newTab.id) {
-          chrome.tabs.sendMessage(previousTabId, { action: "hide_control_state" }).catch(() => {});
-          await chrome.tabs.update(previousTabId, { autoDiscardable: true }).catch(() => {});
+        let previousTabId = null;
+        let res;
+        try {
+          res = await enqueueTabTask(newTab.id, async () => {
+            assertRequestActive();
+            const claimed = await bindSessionTab(sessionId, newTab.id);
+            if (!claimed.ok) throw new Error(`新标签页 [${newTab.id}] 已被会话 "${claimed.owner}" 绑定`);
+            previousTabId = claimed.previousTabId;
+            await chrome.tabs.update(newTab.id, { autoDiscardable: false }).catch(() => {});
+            await waitForTabLoad(newTab.id);
+            await ensureContentScript(newTab.id);
+            assertRequestActive();
+            chrome.tabs.sendMessage(newTab.id, {
+              action: "set_status",
+              payload: { text: "正在加载并感知新页面..." }
+            }).catch(() => {});
+            return chrome.tabs.sendMessage(newTab.id, { action: "look" });
+          });
+        } finally {
+          if (previousTabId && previousTabId !== newTab.id) await releaseUnownedTab(previousTabId);
         }
-        await chrome.tabs.update(newTab.id, { autoDiscardable: false }).catch(() => {});
-
-        await waitForTabLoad(newTab.id);
-        await ensureContentScript(newTab.id);
-        chrome.tabs.sendMessage(newTab.id, {
-          action: "set_status",
-          payload: { text: "正在加载并感知新页面..." }
-        }).catch(() => {});
-        const res = await chrome.tabs.sendMessage(newTab.id, { action: "look" });
         ws.send(JSON.stringify({ id, result: `[已在后台打开新标签页 ${newTab.id}: ${payload.url}]\n\n${res}` }));
         return;
       }
 
       // ─── 动作 2.6: 解除绑定与释放控制 (bctl unbind / bctl release) ───
       if (action === "unbind" || action === "release") {
+        startRequest();
         const releasedTabId = await clearSessionBinding(sessionId);
-        if (releasedTabId) {
-          chrome.tabs.sendMessage(releasedTabId, { action: "hide_control_state" }).catch(() => {});
-          await chrome.tabs.update(releasedTabId, { autoDiscardable: true }).catch(() => {});
-        }
+        await releaseUnownedTab(releasedTabId);
         ws.send(JSON.stringify({
           id,
           result: releasedTabId
@@ -375,7 +453,7 @@ async function connectWS() {
       }
 
       // 刷新当前会话的活跃时间戳
-      touchSession(sessionId).catch(() => {});
+      await touchSession(sessionId);
 
       // 强校验：执行与终端交互类动作必须严格绑定后台标签页，严禁盲目降级回退到前台活动标签
       const REQUIRE_BOUND_ACTIONS = new Set([
@@ -393,6 +471,7 @@ async function connectWS() {
       ]);
 
       const needBound = REQUIRE_BOUND_ACTIONS.has(action);
+      const expectedBinding = await getBoundTabId(sessionId);
       const targetTab = await getTargetTab(sessionId, needBound);
       if (!targetTab) {
         if (needBound) {
@@ -406,716 +485,743 @@ async function connectWS() {
         return;
       }
 
-      // ─── 动作 3: Web 终端命令穿透执行 (bctl exec) ───
-      if (action === "term_exec") {
-        const cmd = payload.cmd || "";
-        const timeoutMs = payload.timeoutMs || 20000;
-        const candidateTarget = payload.candidateTarget || null;
-        await ensureContentScript(targetTab.id);
-        const cmdSummary = cmd.length > 28 ? cmd.slice(0, 28) + "..." : cmd;
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: `正在执行命令: ${cmdSummary}` }
-        }).catch(() => {});
+      return await enqueueTabTask(targetTab.id, async () => {
+        // 锁定标签页后重验归属；force 接管等待正在执行的操作完成。
+        assertRequestActive();
+        const currentBinding = await getBoundTabId(sessionId);
+        const owner = await getBindingOwner(targetTab.id, sessionId);
+        if (owner || (expectedBinding && currentBinding !== targetTab.id) || (needBound && currentBinding !== targetTab.id)) {
+          throw new Error(`[会话隔离拦截] 标签页 [${targetTab.id}] 的归属已变化，请重新查看 bctl tabs 并绑定目标`);
+        }
+        startRequest();
 
-        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
-
-        if (!selected) {
+        // ─── 动作 3: Web 终端命令穿透执行 (bctl exec) ───
+        if (action === "term_exec") {
+          const cmd = payload.cmd || "";
+          const timeoutMs = payload.timeoutMs || 20000;
+          const candidateTarget = payload.candidateTarget || null;
+          await ensureContentScript(targetTab.id);
+          const cmdSummary = cmd.length > 28 ? cmd.slice(0, 28) + "..." : cmd;
           chrome.tabs.sendMessage(targetTab.id, {
             action: "set_status",
-            payload: { text: "终端目标未确认，命令未发送", autoResetDelay: 2500 }
+            payload: { text: `正在执行命令: ${cmdSummary}` }
           }).catch(() => {});
-          ws.send(JSON.stringify({
-            id,
-            result: `${selectionError}。命令未发送。请运行 bctl probe；若候选可辨认，用 bctl exec --target <frameId>:<候选序号> '<命令>' 明确选择。对于没有可访问名称或键盘输入节点的纯像素画布，浏览器脚本无法可靠识别输入位置。`
-          }));
-          return;
-        }
 
-        const executionResults = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
-          world: "MAIN",
-          args: [cmd, timeoutMs, selected.index, false, selected.kind],
-          func: executeInWebTerminal
-        });
-        const execution = executionResults?.find(frame => frame?.result?.matched === true);
-        if (!execution) {
-          chrome.tabs.sendMessage(targetTab.id, {
-            action: "set_status",
-            payload: { text: "终端目标已变化，命令未确认", autoResetDelay: 2500 }
-          }).catch(() => {});
-          ws.send(JSON.stringify({ id, result: "候选在执行前已变化，因此未能确认命令发送。请重新运行 bctl probe 后再试。" }));
-          return;
-        }
-        const hit = execution.result;
+          const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
 
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: hit.ok ? "终端命令执行完成" : "终端命令结果待确认", autoResetDelay: 2500 }
-        }).catch(() => {});
-
-        if (hit.ok) {
-          ws.send(JSON.stringify({ id, result: hit.output }));
-        } else {
-          ws.send(JSON.stringify({
-            id,
-            result: `[执行异常/超时] ${hit.error || "未知错误"}\n${hit.partialOutput || ""}`
-          }));
-        }
-        return;
-      }
-
-      // ─── 动作 3.1: 终端全屏字符网格快照 (bctl screen / term_screen) ───
-      if (action === "term_screen") {
-        const candidateTarget = payload.candidateTarget || null;
-        await ensureContentScript(targetTab.id);
-        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
-        if (!selected) {
-          ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
-          return;
-        }
-
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
-          world: "MAIN",
-          args: ["", 0, selected.index, false, selected.kind, { mode: "screen" }],
-          func: executeInWebTerminal
-        });
-        const execution = results?.find(frame => frame?.result?.matched === true);
-        if (!execution || !execution.result) {
-          ws.send(JSON.stringify({ id, result: { ok: false, error: "未能读取目标终端屏幕" } }));
-          return;
-        }
-        ws.send(JSON.stringify({ id, result: execution.result }));
-        return;
-      }
-
-      // ─── 动作 3.2: 终端交互按键与转义序列发送 (bctl key / term_key) ───
-      if (action === "term_key") {
-        const keys = payload.keys || "";
-        const candidateTarget = payload.candidateTarget || null;
-        const settleMs = payload.settleMs || 150;
-        await ensureContentScript(targetTab.id);
-        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
-        if (!selected) {
-          ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
-          return;
-        }
-
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: `发送按键: ${keys.slice(0, 20)}` }
-        }).catch(() => {});
-
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
-          world: "MAIN",
-          args: ["", 0, selected.index, false, selected.kind, { mode: "key", keys, settleMs }],
-          func: executeInWebTerminal
-        });
-        const execution = results?.find(frame => frame?.result?.matched === true);
-        if (!execution || !execution.result) {
-          ws.send(JSON.stringify({ id, result: { ok: false, error: "向目标终端发送按键失败" } }));
-          return;
-        }
-        ws.send(JSON.stringify({ id, result: execution.result }));
-        return;
-      }
-
-      // ─── 动作 3.3: 启动交互式 TUI 程序 (bctl start / term_start) ───
-      if (action === "term_start") {
-        const cmd = payload.cmd || "";
-        const candidateTarget = payload.candidateTarget || null;
-        const settleMs = payload.settleMs || 800;
-        await ensureContentScript(targetTab.id);
-        const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
-        if (!selected) {
-          ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
-          return;
-        }
-
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: `启动交互程序: ${cmd.slice(0, 24)}` }
-        }).catch(() => {});
-
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, frameIds: [selected.frameId] },
-          world: "MAIN",
-          args: [cmd, 0, selected.index, false, selected.kind, { mode: "start", settleMs }],
-          func: executeInWebTerminal
-        });
-        const execution = results?.find(frame => frame?.result?.matched === true);
-        if (!execution || !execution.result) {
-          ws.send(JSON.stringify({ id, result: { ok: false, error: "启动目标交互程序失败" } }));
-          return;
-        }
-        ws.send(JSON.stringify({ id, result: execution.result }));
-        return;
-      }
-
-      // ─── 动作 3.5: Kibana DevTools / 自研代码编辑器查询执行 (bctl devtools) ───
-      if (action === "devtools_exec") {
-        const query = payload.query || "";
-        const timeoutMs = payload.timeoutMs || 25000;
-        await ensureContentScript(targetTab.id);
-        const qSummary = query.length > 28 ? query.slice(0, 28).replace(/\n/g, " ") + "..." : query.replace(/\n/g, " ");
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: `正在执行查询: ${qSummary}` }
-        }).catch(() => {});
-
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, allFrames: true },
-          world: "MAIN",
-          args: [query, timeoutMs],
-          func: executeInDevTools
-        });
-
-        const hit = results?.find(r => r?.result && r.result.matched === true);
-        if (!hit) {
-          chrome.tabs.sendMessage(targetTab.id, {
-            action: "set_status",
-            payload: { text: "未找到编辑器", autoResetDelay: 2500 }
-          }).catch(() => {});
-          ws.send(JSON.stringify({
-            id,
-            result: `在标签页 [${targetTab.id}] "${targetTab.title}" 中未找到支持的代码/查询编辑器 (支持 Monaco / Ace / CodeMirror / Kibana DevTools)！`
-          }));
-          return;
-        }
-
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: "查询执行完成", autoResetDelay: 2500 }
-        }).catch(() => {});
-
-        if (hit.result.ok) {
-          ws.send(JSON.stringify({ id, result: hit.result.output }));
-        } else {
-          ws.send(JSON.stringify({
-            id,
-            result: `[查询异常/超时] ${hit.result.error || "未知错误"}\n${hit.result.partialOutput || ""}`
-          }));
-        }
-        return;
-      }
-
-      // ─── 动作 3.8: 控制台/终端/编辑器一键探测 (bctl probe) ───
-      if (action === "probe") {
-        await ensureContentScript(targetTab.id);
-        const [terminalResults, editorResults] = await Promise.all([
-          chrome.scripting.executeScript({
-            target: { tabId: targetTab.id, allFrames: true },
-            world: "MAIN",
-            args: ["", 0, null, true],
-            func: executeInWebTerminal
-          }),
-          chrome.scripting.executeScript({
-            target: { tabId: targetTab.id, allFrames: true },
-            world: "MAIN",
-            func: probePageInteractiveCapabilities
-          })
-        ]);
-        const terminals = (terminalResults || []).flatMap(frame =>
-          (frame?.result?.candidates || []).map(candidate => ({
-            ...candidate,
-            frameId: frame.frameId,
-            candidateId: `${frame.frameId}:${candidate.index}`
-          }))
-        );
-        const editors = (editorResults || []).flatMap(frame =>
-          (frame?.result?.editors || []).map(editor => ({ ...editor, frameId: frame.frameId }))
-        );
-        const inputCount = (editorResults || []).reduce((sum, frame) => sum + (frame?.result?.inputsCount || 0), 0);
-        const finalReport = { url: targetTab.url, terminals, editors, inputsCount: inputCount };
-        ws.send(JSON.stringify({ id, result: JSON.stringify(finalReport, null, 2) }));
-        return;
-      }
-
-      // ─── 动作 4: 打开新网址 (bctl open) ───
-      if (action === "open") {
-        await ensureContentScript(targetTab.id);
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: `正在打开网址: ${payload.url}...` }
-        }).catch(() => {});
-        await chrome.tabs.update(targetTab.id, { url: payload.url });
-        await waitForTabLoad(targetTab.id);
-        await ensureContentScript(targetTab.id);
-        const res = await chrome.tabs.sendMessage(targetTab.id, { action: "look" });
-        ws.send(JSON.stringify({ id, result: res }));
-        return;
-      }
-
-      // ─── 动作 4.5: 设置状态描述 (bctl state <描述>) ───
-      if (action === "state" || action === "set_status") {
-        await ensureContentScript(targetTab.id);
-        await chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: payload.text, autoResetDelay: payload.autoResetDelay || 0 }
-        });
-        ws.send(JSON.stringify({ id, result: `已更新受控页面状态提示: "${payload.text}"` }));
-        return;
-      }
-
-      // ─── 动作 4.6: JS 表达式诊断评估 (bctl eval <js>) ───
-      if (action === "eval") {
-        await ensureContentScript(targetTab.id);
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id },
-          world: "MAIN",
-          args: [payload.code],
-          func: async (code) => {
-            try {
-              const res = await (0, eval)(code);
-              return typeof res === "object" ? JSON.stringify(res, null, 2) : String(res);
-            } catch (e) {
-              return "[Eval Error] " + e.message;
-            }
+          if (!selected) {
+            chrome.tabs.sendMessage(targetTab.id, {
+              action: "set_status",
+              payload: { text: "终端目标未确认，命令未发送", autoResetDelay: 2500 }
+            }).catch(() => {});
+            ws.send(JSON.stringify({
+              id,
+              result: `${selectionError}。命令未发送。请运行 bctl probe；若候选可辨认，用 bctl exec --target <frameId>:<候选序号> '<命令>' 明确选择。对于没有可访问名称或键盘输入节点的纯像素画布，浏览器脚本无法可靠识别输入位置。`
+            }));
+            return;
           }
-        });
-        ws.send(JSON.stringify({ id, result: results?.[0]?.result }));
-        return;
-      }
 
-      // ─── 动作 4.7: 内嵌终端标签页列表 (bctl subtabs / bctl terms) ───
-      if (action === "term_tabs" || action === "subtabs") {
-        await ensureContentScript(targetTab.id);
+          assertRequestActive();
+          const executionResults = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+            world: "MAIN",
+            args: [cmd, timeoutMs, selected.index, false, selected.kind],
+            func: executeInWebTerminal
+          });
+          const execution = executionResults?.find(frame => frame?.result?.matched === true);
+          if (!execution) {
+            chrome.tabs.sendMessage(targetTab.id, {
+              action: "set_status",
+              payload: { text: "终端目标已变化，命令未确认", autoResetDelay: 2500 }
+            }).catch(() => {});
+            ws.send(JSON.stringify({ id, result: "候选在执行前已变化，因此未能确认命令发送。请重新运行 bctl probe 后再试。" }));
+            return;
+          }
+          const hit = execution.result;
 
-        // 探测所有 frame 内终端的真实健康状态 (从 buffer 判定断开)
-        const frameHealthResults = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, allFrames: true },
-          world: "MAIN",
-          func: () => {
-            const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"))
-              .filter(el => !(el instanceof SVGElement));
-            const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
-            if (!isTermFrame) return null;
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: hit.ok ? "终端命令执行完成" : "终端命令结果待确认", autoResetDelay: 2500 }
+          }).catch(() => {});
 
-            const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
-            const pickTerm = (obj) => {
-              if (!obj || typeof obj !== "object") return null;
-              if (isTerm(obj)) return obj;
-              if (isTerm(obj.terminal)) return obj.terminal;
-              if (isTerm(obj.term)) return obj.term;
-              if (isTerm(obj.value)) return obj.value;
-              if (isTerm(obj._value)) return obj._value;
-              return null;
-            };
-            let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
-            if (!term) {
-              let el = allXtermEls[0];
-              while (el) {
-                if (isTerm(el._terminal)) { term = el._terminal; break; }
-                if (isTerm(el.term)) { term = el.term; break; }
-                el = el.parentElement;
+          if (hit.ok) {
+            ws.send(JSON.stringify({ id, result: hit.output }));
+          } else {
+            ws.send(JSON.stringify({
+              id,
+              result: `[执行异常/超时] ${hit.error || "未知错误"}\n${hit.partialOutput || ""}`
+            }));
+          }
+          return;
+        }
+
+        // ─── 动作 3.1: 终端全屏字符网格快照 (bctl screen / term_screen) ───
+        if (action === "term_screen") {
+          const candidateTarget = payload.candidateTarget || null;
+          await ensureContentScript(targetTab.id);
+          const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
+          if (!selected) {
+            ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
+            return;
+          }
+
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+            world: "MAIN",
+            args: ["", 0, selected.index, false, selected.kind, { mode: "screen" }],
+            func: executeInWebTerminal
+          });
+          const execution = results?.find(frame => frame?.result?.matched === true);
+          if (!execution || !execution.result) {
+            ws.send(JSON.stringify({ id, result: { ok: false, error: "未能读取目标终端屏幕" } }));
+            return;
+          }
+          ws.send(JSON.stringify({ id, result: execution.result }));
+          return;
+        }
+
+        // ─── 动作 3.2: 终端交互按键与转义序列发送 (bctl key / term_key) ───
+        if (action === "term_key") {
+          const keys = payload.keys || "";
+          const candidateTarget = payload.candidateTarget || null;
+          const settleMs = payload.settleMs || 150;
+          await ensureContentScript(targetTab.id);
+          const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
+          if (!selected) {
+            ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
+            return;
+          }
+
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: `发送按键: ${keys.slice(0, 20)}` }
+          }).catch(() => {});
+
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+            world: "MAIN",
+            args: ["", 0, selected.index, false, selected.kind, { mode: "key", keys, settleMs }],
+            func: executeInWebTerminal
+          });
+          const execution = results?.find(frame => frame?.result?.matched === true);
+          if (!execution || !execution.result) {
+            ws.send(JSON.stringify({ id, result: { ok: false, error: "向目标终端发送按键失败" } }));
+            return;
+          }
+          ws.send(JSON.stringify({ id, result: execution.result }));
+          return;
+        }
+
+        // ─── 动作 3.3: 启动交互式 TUI 程序 (bctl start / term_start) ───
+        if (action === "term_start") {
+          const cmd = payload.cmd || "";
+          const candidateTarget = payload.candidateTarget || null;
+          const settleMs = payload.settleMs || 800;
+          await ensureContentScript(targetTab.id);
+          const { selected, error: selectionError } = await resolveSelectedTerminal(targetTab.id, candidateTarget);
+          if (!selected) {
+            ws.send(JSON.stringify({ id, result: { ok: false, error: selectionError } }));
+            return;
+          }
+
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: `启动交互程序: ${cmd.slice(0, 24)}` }
+          }).catch(() => {});
+
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, frameIds: [selected.frameId] },
+            world: "MAIN",
+            args: [cmd, 0, selected.index, false, selected.kind, { mode: "start", settleMs }],
+            func: executeInWebTerminal
+          });
+          const execution = results?.find(frame => frame?.result?.matched === true);
+          if (!execution || !execution.result) {
+            ws.send(JSON.stringify({ id, result: { ok: false, error: "启动目标交互程序失败" } }));
+            return;
+          }
+          ws.send(JSON.stringify({ id, result: execution.result }));
+          return;
+        }
+
+        // ─── 动作 3.5: Kibana DevTools / 自研代码编辑器查询执行 (bctl devtools) ───
+        if (action === "devtools_exec") {
+          const query = payload.query || "";
+          const timeoutMs = payload.timeoutMs || 25000;
+          await ensureContentScript(targetTab.id);
+          const qSummary = query.length > 28 ? query.slice(0, 28).replace(/\n/g, " ") + "..." : query.replace(/\n/g, " ");
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: `正在执行查询: ${qSummary}` }
+          }).catch(() => {});
+
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, allFrames: true },
+            world: "MAIN",
+            args: [query, timeoutMs],
+            func: executeInDevTools
+          });
+
+          const hit = results?.find(r => r?.result && r.result.matched === true);
+          if (!hit) {
+            chrome.tabs.sendMessage(targetTab.id, {
+              action: "set_status",
+              payload: { text: "未找到编辑器", autoResetDelay: 2500 }
+            }).catch(() => {});
+            ws.send(JSON.stringify({
+              id,
+              result: `在标签页 [${targetTab.id}] "${targetTab.title}" 中未找到支持的代码/查询编辑器 (支持 Monaco / Ace / CodeMirror / Kibana DevTools)！`
+            }));
+            return;
+          }
+
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: "查询执行完成", autoResetDelay: 2500 }
+          }).catch(() => {});
+
+          if (hit.result.ok) {
+            ws.send(JSON.stringify({ id, result: hit.result.output }));
+          } else {
+            ws.send(JSON.stringify({
+              id,
+              result: `[查询异常/超时] ${hit.result.error || "未知错误"}\n${hit.result.partialOutput || ""}`
+            }));
+          }
+          return;
+        }
+
+        // ─── 动作 3.8: 控制台/终端/编辑器一键探测 (bctl probe) ───
+        if (action === "probe") {
+          await ensureContentScript(targetTab.id);
+          assertRequestActive();
+          const [terminalResults, editorResults] = await Promise.all([
+            chrome.scripting.executeScript({
+              target: { tabId: targetTab.id, allFrames: true },
+              world: "MAIN",
+              args: ["", 0, null, true],
+              func: executeInWebTerminal
+            }),
+            chrome.scripting.executeScript({
+              target: { tabId: targetTab.id, allFrames: true },
+              world: "MAIN",
+              func: probePageInteractiveCapabilities
+            })
+          ]);
+          const terminals = (terminalResults || []).flatMap(frame =>
+            (frame?.result?.candidates || []).map(candidate => ({
+              ...candidate,
+              frameId: frame.frameId,
+              candidateId: `${frame.frameId}:${candidate.index}`
+            }))
+          );
+          const editors = (editorResults || []).flatMap(frame =>
+            (frame?.result?.editors || []).map(editor => ({ ...editor, frameId: frame.frameId }))
+          );
+          const inputCount = (editorResults || []).reduce((sum, frame) => sum + (frame?.result?.inputsCount || 0), 0);
+          const finalReport = { url: targetTab.url, terminals, editors, inputsCount: inputCount };
+          ws.send(JSON.stringify({ id, result: JSON.stringify(finalReport, null, 2) }));
+          return;
+        }
+
+        // ─── 动作 4: 打开新网址 (bctl open) ───
+        if (action === "open") {
+          await ensureContentScript(targetTab.id);
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: `正在打开网址: ${payload.url}...` }
+          }).catch(() => {});
+          assertRequestActive();
+          await chrome.tabs.update(targetTab.id, { url: payload.url });
+          await waitForTabLoad(targetTab.id);
+          await ensureContentScript(targetTab.id);
+          assertRequestActive();
+          const res = await chrome.tabs.sendMessage(targetTab.id, { action: "look" });
+          ws.send(JSON.stringify({ id, result: res }));
+          return;
+        }
+
+        // ─── 动作 4.5: 设置状态描述 (bctl state <描述>) ───
+        if (action === "state" || action === "set_status") {
+          await ensureContentScript(targetTab.id);
+          assertRequestActive();
+          await chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: payload.text, autoResetDelay: payload.autoResetDelay || 0 }
+          });
+          ws.send(JSON.stringify({ id, result: `已更新受控页面状态提示: "${payload.text}"` }));
+          return;
+        }
+
+        // ─── 动作 4.6: JS 表达式诊断评估 (bctl eval <js>) ───
+        if (action === "eval") {
+          await ensureContentScript(targetTab.id);
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            world: "MAIN",
+            args: [payload.code],
+            func: async (code) => {
+              try {
+                const res = await (0, eval)(code);
+                return typeof res === "object" ? JSON.stringify(res, null, 2) : String(res);
+              } catch (e) {
+                return "[Eval Error] " + e.message;
               }
             }
-            if (!term) {
-              try {
-                const pinia = document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$pinia;
-                const state = pinia?.state?.value;
-                if (state) {
-                  term = pickTerm(state.connection?.terminal) || pickTerm(state.connection);
-                  if (!term) {
-                    const map = state.tree?.terminalMap;
-                    if (map && typeof map.forEach === "function") {
-                      map.forEach((entry) => { if (!term) term = pickTerm(entry); });
+          });
+          ws.send(JSON.stringify({ id, result: results?.[0]?.result }));
+          return;
+        }
+
+        // ─── 动作 4.7: 内嵌终端标签页列表 (bctl subtabs / bctl terms) ───
+        if (action === "term_tabs" || action === "subtabs") {
+          await ensureContentScript(targetTab.id);
+
+          // 探测所有 frame 内终端的真实健康状态 (从 buffer 判定断开)
+          assertRequestActive();
+          const frameHealthResults = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, allFrames: true },
+            world: "MAIN",
+            func: () => {
+              const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"))
+                .filter(el => !(el instanceof SVGElement));
+              const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
+              if (!isTermFrame) return null;
+
+              const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
+              const pickTerm = (obj) => {
+                if (!obj || typeof obj !== "object") return null;
+                if (isTerm(obj)) return obj;
+                if (isTerm(obj.terminal)) return obj.terminal;
+                if (isTerm(obj.term)) return obj.term;
+                if (isTerm(obj.value)) return obj.value;
+                if (isTerm(obj._value)) return obj._value;
+                return null;
+              };
+              let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
+              if (!term) {
+                let el = allXtermEls[0];
+                while (el) {
+                  if (isTerm(el._terminal)) { term = el._terminal; break; }
+                  if (isTerm(el.term)) { term = el.term; break; }
+                  el = el.parentElement;
+                }
+              }
+              if (!term) {
+                try {
+                  const pinia = document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$pinia;
+                  const state = pinia?.state?.value;
+                  if (state) {
+                    term = pickTerm(state.connection?.terminal) || pickTerm(state.connection);
+                    if (!term) {
+                      const map = state.tree?.terminalMap;
+                      if (map && typeof map.forEach === "function") {
+                        map.forEach((entry) => { if (!term) term = pickTerm(entry); });
+                      }
                     }
                   }
-                }
-              } catch (_) {}
-            }
-
-            let isDisconnected = false;
-            let tail = "";
-            if (term && term.buffer && term.buffer.active) {
-              const buf = term.buffer.active;
-              let lines = [];
-              for (let r = Math.max(0, buf.baseY + buf.cursorY - 4); r <= buf.baseY + buf.cursorY; r++) {
-                const line = buf.getLine(r);
-                if (line) lines.push(line.translateToString(true));
+                } catch (_) {}
               }
-              tail = lines.join("\n");
-              isDisconnected = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
+
+              let isDisconnected = false;
+              let tail = "";
+              if (term && term.buffer && term.buffer.active) {
+                const buf = term.buffer.active;
+                let lines = [];
+                for (let r = Math.max(0, buf.baseY + buf.cursorY - 4); r <= buf.baseY + buf.cursorY; r++) {
+                  const line = buf.getLine(r);
+                  if (line) lines.push(line.translateToString(true));
+                }
+                tail = lines.join("\n");
+                isDisconnected = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
+              }
+              return { href: location.href, isDisconnected, tail };
             }
-            return { href: location.href, isDisconnected, tail };
-          }
-        });
+          });
 
-        const healthMap = new Map();
-        for (const item of (frameHealthResults || [])) {
-          if (item?.result?.href) {
-            healthMap.set(item.result.href, item.result.isDisconnected);
+          const healthMap = new Map();
+          for (const item of (frameHealthResults || [])) {
+            if (item?.result?.href) {
+              healthMap.set(item.result.href, item.result.isDisconnected);
+            }
           }
-        }
 
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id },
-          world: "MAIN",
-          func: () => {
-            // 1. 华为云堡垒机 / 云匣子 (yabProxyGuac) 多会话列表感知
-            const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
-            if (yabRoot && Array.isArray(yabRoot.batchLoginConnectData) && yabRoot.batchLoginConnectData.length > 0) {
-              const curId = yabRoot.connectDetailData?.id;
-              const list = yabRoot.batchLoginConnectData.map((item, idx) => {
-                const baseGuac = typeof yabRoot.getBaseGuac === "function" ? yabRoot.getBaseGuac(item) : null;
-                const connState = baseGuac?.managedClient?.clientState?.connectionState;
-                const isDisc = connState && connState !== "CONNECTED" && connState !== "WAITING" && connState !== "CONNECTING";
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            world: "MAIN",
+            func: () => {
+              // 1. 华为云堡垒机 / 云匣子 (yabProxyGuac) 多会话列表感知
+              const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
+              if (yabRoot && Array.isArray(yabRoot.batchLoginConnectData) && yabRoot.batchLoginConnectData.length > 0) {
+                const curId = yabRoot.connectDetailData?.id;
+                const list = yabRoot.batchLoginConnectData.map((item, idx) => {
+                  const baseGuac = typeof yabRoot.getBaseGuac === "function" ? yabRoot.getBaseGuac(item) : null;
+                  const connState = baseGuac?.managedClient?.clientState?.connectionState;
+                  const isDisc = connState && connState !== "CONNECTED" && connState !== "WAITING" && connState !== "CONNECTING";
+                  return {
+                    idx,
+                    id: item.id,
+                    title: `${item.name || "Host"} (${item.accountName ? item.accountName + "@" : ""}${item.address || ""})`,
+                    active: item.id === curId,
+                    src: item.id,
+                    disconnected: Boolean(isDisc)
+                  };
+                });
+                return { type: "yab_guac", tabs: list };
+              }
+
+              // 2. JumpServer Luna 多标签感知
+              const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+              const windows = Array.from(document.querySelectorAll(".window"));
+              if (lunaTabs.length === 0) {
+                const hasTerm = !!document.querySelector(".xterm, .xterm-helper-textarea, #yabProxyGuac, #inputArea.target");
                 return {
-                  idx,
-                  id: item.id,
-                  title: `${item.name || "Host"} (${item.accountName ? item.accountName + "@" : ""}${item.address || ""})`,
-                  active: item.id === curId,
-                  src: item.id,
-                  disconnected: Boolean(isDisc)
+                  type: hasTerm ? "single" : "none",
+                  tabs: hasTerm ? [{ idx: 0, title: document.title || "Web Terminal", active: true, status: "connected" }] : []
                 };
+              }
+              const list = lunaTabs.map((li, idx) => {
+                const title = li.getAttribute("title") || li.innerText.replace("×", "").trim();
+                const active = li.classList.contains("active");
+                const win = windows[idx];
+                const iframe = win?.querySelector("iframe");
+                const src = iframe?.src || "";
+                return { idx, id: li.id, title, active, src };
               });
-              return { type: "yab_guac", tabs: list };
+              return { type: "jumpserver", tabs: list };
             }
+          });
 
-            // 2. JumpServer Luna 多标签感知
-            const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
-            const windows = Array.from(document.querySelectorAll(".window"));
-            if (lunaTabs.length === 0) {
-              const hasTerm = !!document.querySelector(".xterm, .xterm-helper-textarea, #yabProxyGuac, #inputArea.target");
-              return {
-                type: hasTerm ? "single" : "none",
-                tabs: hasTerm ? [{ idx: 0, title: document.title || "Web Terminal", active: true, status: "connected" }] : []
-              };
-            }
-            const list = lunaTabs.map((li, idx) => {
-              const title = li.getAttribute("title") || li.innerText.replace("×", "").trim();
-              const active = li.classList.contains("active");
-              const win = windows[idx];
-              const iframe = win?.querySelector("iframe");
-              const src = iframe?.src || "";
-              return { idx, id: li.id, title, active, src };
-            });
-            return { type: "jumpserver", tabs: list };
+          const report = results?.[0]?.result;
+          if (!report || report.tabs.length === 0) {
+            ws.send(JSON.stringify({ id, result: "当前页面未检测到支持的 Web 终端标签页" }));
+            return;
           }
-        });
 
-        const report = results?.[0]?.result;
-        if (!report || report.tabs.length === 0) {
-          ws.send(JSON.stringify({ id, result: "当前页面未检测到支持的 Web 终端标签页" }));
+          const lines = report.tabs.map(t => {
+            const isDisconnected = t.disconnected === true || healthMap.get(t.src) === true;
+            const activeTag = t.active ? " [当前激活]" : "";
+            const statusTag = isDisconnected ? " (连接已断开: Connection closed)" : " (已连接)";
+            return `[${t.idx}] ${t.title}${activeTag}${statusTag}`;
+          });
+
+          const header = `Web 终端标签页 (共 ${report.tabs.length} 个):`;
+          ws.send(JSON.stringify({ id, result: `${header}\n${lines.join("\n")}\n\n* 可使用 \`bctl switch <IP|标题|序号>\` 快速切换终端\n* 可使用 \`bctl connect <IP>\` 智能按需连接 (优先复用已连接标签)` }));
           return;
         }
 
-        const lines = report.tabs.map(t => {
-          const isDisconnected = t.disconnected === true || healthMap.get(t.src) === true;
-          const activeTag = t.active ? " [当前激活]" : "";
-          const statusTag = isDisconnected ? " (连接已断开: Connection closed)" : " (已连接)";
-          return `[${t.idx}] ${t.title}${activeTag}${statusTag}`;
-        });
+        // ─── 动作 4.8: 内嵌终端标签页切换 (bctl switch <目标>) ───
+        if (action === "term_switch" || action === "subswitch") {
+          const target = payload.target || "";
+          await ensureContentScript(targetTab.id);
+          assertRequestActive();
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            world: "MAIN",
+            args: [target],
+            func: (query) => {
+              const q = String(query).toLowerCase().trim();
 
-        const header = `Web 终端标签页 (共 ${report.tabs.length} 个):`;
-        ws.send(JSON.stringify({ id, result: `${header}\n${lines.join("\n")}\n\n* 可使用 \`bctl switch <IP|标题|序号>\` 快速切换终端\n* 可使用 \`bctl connect <IP>\` 智能按需连接 (优先复用已连接标签)` }));
-        return;
-      }
+              // 1. 华为云堡垒机 / 云匣子多会话切换
+              const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
+              if (yabRoot && Array.isArray(yabRoot.batchLoginConnectData) && yabRoot.batchLoginConnectData.length > 0) {
+                const list = yabRoot.batchLoginConnectData;
+                let matchIndex = -1;
+                if (/^\d+$/.test(q)) {
+                  matchIndex = parseInt(q, 10);
+                } else {
+                  matchIndex = list.findIndex(item =>
+                    (item.name || "").toLowerCase().includes(q) ||
+                    (item.address || "").toLowerCase().includes(q)
+                  );
+                }
+                if (matchIndex < 0 || matchIndex >= list.length) {
+                  const titles = list.map((item, i) => `[${i}] ${item.name} (${item.address})`).join("\n");
+                  return { ok: false, error: `未找到匹配 "${query}" 的终端标签！当前可用终端：\n${titles}` };
+                }
+                const targetItem = list[matchIndex];
+                yabRoot.$store?.commit("SET_H5_CONNECT_DETAIL", targetItem);
+                return { ok: true, idx: matchIndex, title: `${targetItem.name} (${targetItem.address})` };
+              }
 
-      // ─── 动作 4.8: 内嵌终端标签页切换 (bctl switch <目标>) ───
-      if (action === "term_switch" || action === "subswitch") {
-        const target = payload.target || "";
-        await ensureContentScript(targetTab.id);
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id },
-          world: "MAIN",
-          args: [target],
-          func: (query) => {
-            const q = String(query).toLowerCase().trim();
+              // 2. JumpServer Luna 多标签切换
+              const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+              if (lunaTabs.length === 0) return { ok: false, error: "当前页面未检测到支持切换的多终端标签栏" };
 
-            // 1. 华为云堡垒机 / 云匣子多会话切换
-            const yabRoot = document.querySelector(".yab-proxy-root")?.__vue__;
-            if (yabRoot && Array.isArray(yabRoot.batchLoginConnectData) && yabRoot.batchLoginConnectData.length > 0) {
-              const list = yabRoot.batchLoginConnectData;
               let matchIndex = -1;
               if (/^\d+$/.test(q)) {
                 matchIndex = parseInt(q, 10);
               } else {
-                matchIndex = list.findIndex(item =>
-                  (item.name || "").toLowerCase().includes(q) ||
-                  (item.address || "").toLowerCase().includes(q)
-                );
+                matchIndex = lunaTabs.findIndex(li => {
+                  const title = (li.getAttribute("title") || li.innerText || "").toLowerCase();
+                  return title.includes(q);
+                });
               }
-              if (matchIndex < 0 || matchIndex >= list.length) {
-                const titles = list.map((item, i) => `[${i}] ${item.name} (${item.address})`).join("\n");
+
+              if (matchIndex < 0 || matchIndex >= lunaTabs.length) {
+                const titles = lunaTabs.map((li, i) => `[${i}] ${li.getAttribute("title") || li.innerText.replace("×", "").trim()}`).join("\n");
                 return { ok: false, error: `未找到匹配 "${query}" 的终端标签！当前可用终端：\n${titles}` };
               }
-              const targetItem = list[matchIndex];
-              yabRoot.$store?.commit("SET_H5_CONNECT_DETAIL", targetItem);
-              return { ok: true, idx: matchIndex, title: `${targetItem.name} (${targetItem.address})` };
+
+              const targetLi = lunaTabs[matchIndex];
+              const title = targetLi.getAttribute("title") || targetLi.innerText.replace("×", "").trim();
+              const clickEl = targetLi.querySelector("span") || targetLi;
+              clickEl.click();
+
+              return { ok: true, idx: matchIndex, title };
             }
+          });
 
-            // 2. JumpServer Luna 多标签切换
-            const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
-            if (lunaTabs.length === 0) return { ok: false, error: "当前页面未检测到支持切换的多终端标签栏" };
-
-            let matchIndex = -1;
-            if (/^\d+$/.test(q)) {
-              matchIndex = parseInt(q, 10);
-            } else {
-              matchIndex = lunaTabs.findIndex(li => {
-                const title = (li.getAttribute("title") || li.innerText || "").toLowerCase();
-                return title.includes(q);
-              });
-            }
-
-            if (matchIndex < 0 || matchIndex >= lunaTabs.length) {
-              const titles = lunaTabs.map((li, i) => `[${i}] ${li.getAttribute("title") || li.innerText.replace("×", "").trim()}`).join("\n");
-              return { ok: false, error: `未找到匹配 "${query}" 的终端标签！当前可用终端：\n${titles}` };
-            }
-
-            const targetLi = lunaTabs[matchIndex];
-            const title = targetLi.getAttribute("title") || targetLi.innerText.replace("×", "").trim();
-            const clickEl = targetLi.querySelector("span") || targetLi;
-            clickEl.click();
-
-            return { ok: true, idx: matchIndex, title };
+          const r = results?.[0]?.result;
+          if (!r?.ok) {
+            ws.send(JSON.stringify({ id, result: `[切换失败] ${r?.error || "未知错误"}` }));
+          } else {
+            ws.send(JSON.stringify({ id, result: `已成功切换到终端标签页 [${r.idx}] "${r.title}"` }));
           }
-        });
-
-        const r = results?.[0]?.result;
-        if (!r?.ok) {
-          ws.send(JSON.stringify({ id, result: `[切换失败] ${r?.error || "未知错误"}` }));
-        } else {
-          ws.send(JSON.stringify({ id, result: `已成功切换到终端标签页 [${r.idx}] "${r.title}"` }));
+          return;
         }
-        return;
-      }
 
-      // ─── 动作 4.9: 智能按需连接 (bctl connect <IP|主机名> [--new]) ───
-      if (action === "term_connect" || action === "jump") {
-        const target = payload.target || "";
-        const forceNew = !!payload.forceNew;
-        await ensureContentScript(targetTab.id);
+        // ─── 动作 4.9: 智能按需连接 (bctl connect <IP|主机名> [--new]) ───
+        if (action === "term_connect" || action === "jump") {
+          const target = payload.target || "";
+          const forceNew = !!payload.forceNew;
+          await ensureContentScript(targetTab.id);
 
-        // 1. 探测各 frame 真实连接状态与已有终端标签
-        const frameHealthResults = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id, allFrames: true },
-          world: "MAIN",
-          func: () => {
-            const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
-            const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
-            if (!isTermFrame) return null;
+          // 1. 探测各 frame 真实连接状态与已有终端标签
+          assertRequestActive();
+          const frameHealthResults = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id, allFrames: true },
+            world: "MAIN",
+            func: () => {
+              const allXtermEls = Array.from(document.querySelectorAll(".xterm, .xterm-helper-textarea, [class*='terminal' i], [id*='terminal' i]"));
+              const isTermFrame = location.pathname.includes("/koko/") || allXtermEls.length > 0 || window.term || window.terminal;
+              if (!isTermFrame) return null;
 
-            const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
-            const pickTerm = (obj) => {
-              if (!obj || typeof obj !== "object") return null;
-              if (isTerm(obj)) return obj;
-              if (isTerm(obj.terminal)) return obj.terminal;
-              if (isTerm(obj.term)) return obj.term;
-              if (isTerm(obj.value)) return obj.value;
-              if (isTerm(obj._value)) return obj._value;
-              return null;
-            };
-            let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
-            if (!term) {
-              let el = allXtermEls[0];
-              while (el) {
-                if (isTerm(el._terminal)) { term = el._terminal; break; }
-                if (isTerm(el.term)) { term = el.term; break; }
-                el = el.parentElement;
+              const isTerm = (obj) => obj && (typeof obj.paste === "function" || typeof obj.write === "function") && obj.buffer && obj.buffer.active;
+              const pickTerm = (obj) => {
+                if (!obj || typeof obj !== "object") return null;
+                if (isTerm(obj)) return obj;
+                if (isTerm(obj.terminal)) return obj.terminal;
+                if (isTerm(obj.term)) return obj.term;
+                if (isTerm(obj.value)) return obj.value;
+                if (isTerm(obj._value)) return obj._value;
+                return null;
+              };
+              let term = isTerm(window.term) ? window.term : (isTerm(window.terminal) ? window.terminal : null);
+              if (!term) {
+                let el = allXtermEls[0];
+                while (el) {
+                  if (isTerm(el._terminal)) { term = el._terminal; break; }
+                  if (isTerm(el.term)) { term = el.term; break; }
+                  el = el.parentElement;
+                }
               }
-            }
-            if (!term) {
-              try {
-                const pinia = document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$pinia;
-                const state = pinia?.state?.value;
-                if (state) {
-                  term = pickTerm(state.connection?.terminal) || pickTerm(state.connection);
-                  if (!term) {
-                    const map = state.tree?.terminalMap;
-                    if (map && typeof map.forEach === "function") {
-                      map.forEach((entry) => { if (!term) term = pickTerm(entry); });
+              if (!term) {
+                try {
+                  const pinia = document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$pinia;
+                  const state = pinia?.state?.value;
+                  if (state) {
+                    term = pickTerm(state.connection?.terminal) || pickTerm(state.connection);
+                    if (!term) {
+                      const map = state.tree?.terminalMap;
+                      if (map && typeof map.forEach === "function") {
+                        map.forEach((entry) => { if (!term) term = pickTerm(entry); });
+                      }
                     }
                   }
-                }
-              } catch (_) {}
-            }
-
-            let isDisconnected = false;
-            if (term && term.buffer && term.buffer.active) {
-              const buf = term.buffer.active;
-              let lines = [];
-              for (let r = Math.max(0, buf.baseY + buf.cursorY - 4); r <= buf.baseY + buf.cursorY; r++) {
-                const line = buf.getLine(r);
-                if (line) lines.push(line.translateToString(true));
+                } catch (_) {}
               }
-              const tail = lines.join("\n");
-              isDisconnected = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
-            }
-            return { href: location.href, isDisconnected };
-          }
-        });
 
-        const healthMap = new Map();
-        for (const item of (frameHealthResults || [])) {
-          if (item?.result?.href) {
-            healthMap.set(item.result.href, item.result.isDisconnected);
-          }
-        }
-
-        const checkRes = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id },
-          world: "MAIN",
-          func: () => {
-            const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
-            const windows = Array.from(document.querySelectorAll(".window"));
-            return lunaTabs.map((li, idx) => {
-              const title = li.getAttribute("title") || li.innerText.replace("×", "").trim();
-              const active = li.classList.contains("active");
-              const win = windows[idx];
-              const iframe = win?.querySelector("iframe");
-              const src = iframe?.src || "";
-              return { idx, id: li.id, title, active, src };
-            });
-          }
-        });
-
-        const existingTabs = (checkRes?.[0]?.result || []).map(t => ({
-          ...t,
-          status: healthMap.get(t.src) === true ? "disconnected" : "connected"
-        }));
-        const q = String(target).toLowerCase().trim();
-        const matched = existingTabs.find(t => t.title.toLowerCase().includes(q));
-
-        // 如果找到已有标签
-        if (matched && !forceNew) {
-          if (matched.status !== "disconnected") {
-            // 连接存活：直接切换复用！
-            await chrome.scripting.executeScript({
-              target: { tabId: targetTab.id },
-              world: "MAIN",
-              args: [matched.idx],
-              func: (idx) => {
-                const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
-                const targetLi = lunaTabs[idx];
-                if (targetLi && !targetLi.classList.contains("active")) {
-                  (targetLi.querySelector("span") || targetLi).click();
+              let isDisconnected = false;
+              if (term && term.buffer && term.buffer.active) {
+                const buf = term.buffer.active;
+                let lines = [];
+                for (let r = Math.max(0, buf.baseY + buf.cursorY - 4); r <= buf.baseY + buf.cursorY; r++) {
+                  const line = buf.getLine(r);
+                  if (line) lines.push(line.translateToString(true));
                 }
+                const tail = lines.join("\n");
+                isDisconnected = /Connection websocket closed|Connection closed|会话已断开|连接已关闭/i.test(tail);
               }
-            });
-            ws.send(JSON.stringify({
-              id,
-              result: `[复用现有终端] 发现已连接的终端标签页 [${matched.idx}] "${matched.title}"，已直接切换复用（未新开）！`
-            }));
-            return;
+              return { href: location.href, isDisconnected };
+            }
+          });
+
+          const healthMap = new Map();
+          for (const item of (frameHealthResults || [])) {
+            if (item?.result?.href) {
+              healthMap.set(item.result.href, item.result.isDisconnected);
+            }
+          }
+
+          assertRequestActive();
+          const checkRes = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            world: "MAIN",
+            func: () => {
+              const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+              const windows = Array.from(document.querySelectorAll(".window"));
+              return lunaTabs.map((li, idx) => {
+                const title = li.getAttribute("title") || li.innerText.replace("×", "").trim();
+                const active = li.classList.contains("active");
+                const win = windows[idx];
+                const iframe = win?.querySelector("iframe");
+                const src = iframe?.src || "";
+                return { idx, id: li.id, title, active, src };
+              });
+            }
+          });
+
+          const existingTabs = (checkRes?.[0]?.result || []).map(t => ({
+            ...t,
+            status: healthMap.get(t.src) === true ? "disconnected" : "connected"
+          }));
+          const q = String(target).toLowerCase().trim();
+          const matched = existingTabs.find(t => t.title.toLowerCase().includes(q));
+
+          // 如果找到已有标签
+          if (matched && !forceNew) {
+            if (matched.status !== "disconnected") {
+              // 连接存活：直接切换复用！
+              await chrome.scripting.executeScript({
+                target: { tabId: targetTab.id },
+                world: "MAIN",
+                args: [matched.idx],
+                func: (idx) => {
+                  const lunaTabs = Array.from(document.querySelectorAll(".tabs li, elements-content-tab li"));
+                  const targetLi = lunaTabs[idx];
+                  if (targetLi && !targetLi.classList.contains("active")) {
+                    (targetLi.querySelector("span") || targetLi).click();
+                  }
+                }
+              });
+              ws.send(JSON.stringify({
+                id,
+                result: `[复用现有终端] 发现已连接的终端标签页 [${matched.idx}] "${matched.title}"，已直接切换复用（未新开）！`
+              }));
+              return;
+            } else {
+              // 已断开连接：关闭旧标签，继续新建
+              await chrome.scripting.executeScript({
+                target: { tabId: targetTab.id },
+                world: "MAIN",
+                args: [matched.id],
+                func: (id) => {
+                  const oldTab = document.getElementById(id);
+                  oldTab?.querySelector(".close")?.click();
+                }
+              });
+              await new Promise(r => setTimeout(r, 600));
+            }
+          }
+
+          // 2. 在 JumpServer 资产树中搜索并新建连接
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: `正在连接主机: ${target}...` }
+          }).catch(() => {});
+
+          assertRequestActive();
+          const createRes = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            world: "MAIN",
+            args: [target],
+            func: async (keyword) => {
+              const searchInput = document.querySelector("#assetsSearchInput, #AssetTreeSearchInput, .tree-input");
+              if (!searchInput) return { ok: false, error: "未在当前页面找到 JumpServer 资产搜索框 (#assetsSearchInput / #AssetTreeSearchInput)" };
+
+              searchInput.value = keyword;
+              searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+              searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
+              searchInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, bubbles: true }));
+
+              // 等待搜索结果出现
+              const startTime = Date.now();
+              let matchedNode = null;
+              while (Date.now() - startTime < 3500) {
+                const nodes = Array.from(document.querySelectorAll("#assetsTree a, .ztree a"));
+                matchedNode = nodes.find(a => a.getBoundingClientRect().width > 0 && a.innerText && a.innerText.toLowerCase().includes(keyword.toLowerCase()));
+                if (matchedNode) break;
+                await new Promise(r => setTimeout(r, 200));
+              }
+
+              if (!matchedNode) {
+                return { ok: false, error: `在 JumpServer 资产树中未找到匹配 "${keyword}" 的主机节点` };
+              }
+
+              // 点击节点触发连接
+              matchedNode.click();
+
+              // 监听并自动点击确认弹窗 (mat-dialog / modal)
+              const modalStartTime = Date.now();
+              while (Date.now() - modalStartTime < 2500) {
+                const dialog = document.querySelector("mat-dialog-container, .modal, .dialog");
+                if (dialog) {
+                  const btns = Array.from(dialog.querySelectorAll("button"));
+                  const confirmBtn = btns.find(b => b.innerText && (b.innerText.includes("确认") || b.innerText.includes("确定") || b.innerText.includes("OK")));
+                  if (confirmBtn) {
+                    const rect = confirmBtn.getBoundingClientRect();
+                    const x = rect.left + rect.width / 2;
+                    const y = rect.top + rect.height / 2;
+                    const topEl = document.elementFromPoint(x, y) || confirmBtn.querySelector("span") || confirmBtn;
+                    ["mousedown", "mouseup", "click"].forEach(type => {
+                      topEl.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+                    });
+                    confirmBtn.click();
+                    break;
+                  }
+                }
+                const activeTab = document.querySelector(".tabs li.active");
+                if (activeTab && activeTab.innerText.toLowerCase().includes(keyword.toLowerCase())) break;
+                await new Promise(r => setTimeout(r, 200));
+              }
+
+              // 等待新标签页渲染
+              await new Promise(r => setTimeout(r, 1500));
+              const finalTab = document.querySelector(".tabs li.active");
+              const title = finalTab ? (finalTab.getAttribute("title") || finalTab.innerText.replace("×", "").trim()) : keyword;
+              return { ok: true, title };
+            }
+          });
+
+          const r = createRes?.[0]?.result;
+          chrome.tabs.sendMessage(targetTab.id, {
+            action: "set_status",
+            payload: { text: "终端就绪", autoResetDelay: 2500 }
+          }).catch(() => {});
+
+          if (!r?.ok) {
+            ws.send(JSON.stringify({ id, result: `[连接失败] ${r?.error || "未知异常"}` }));
           } else {
-            // 已断开连接：关闭旧标签，继续新建
-            await chrome.scripting.executeScript({
-              target: { tabId: targetTab.id },
-              world: "MAIN",
-              args: [matched.id],
-              func: (id) => {
-                const oldTab = document.getElementById(id);
-                oldTab?.querySelector(".close")?.click();
-              }
-            });
-            await new Promise(r => setTimeout(r, 600));
+            ws.send(JSON.stringify({ id, result: `[新开终端就绪] 已在 JumpServer 连接并切换至终端标签页: "${r.title}"` }));
           }
+          return;
         }
 
-        // 2. 在 JumpServer 资产树中搜索并新建连接
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: `正在连接主机: ${target}...` }
-        }).catch(() => {});
-
-        const createRes = await chrome.scripting.executeScript({
-          target: { tabId: targetTab.id },
-          world: "MAIN",
-          args: [target],
-          func: async (keyword) => {
-            const searchInput = document.querySelector("#assetsSearchInput, #AssetTreeSearchInput, .tree-input");
-            if (!searchInput) return { ok: false, error: "未在当前页面找到 JumpServer 资产搜索框 (#assetsSearchInput / #AssetTreeSearchInput)" };
-
-            searchInput.value = keyword;
-            searchInput.dispatchEvent(new Event("input", { bubbles: true }));
-            searchInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", keyCode: 13, bubbles: true }));
-            searchInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", keyCode: 13, bubbles: true }));
-
-            // 等待搜索结果出现
-            const startTime = Date.now();
-            let matchedNode = null;
-            while (Date.now() - startTime < 3500) {
-              const nodes = Array.from(document.querySelectorAll("#assetsTree a, .ztree a"));
-              matchedNode = nodes.find(a => a.getBoundingClientRect().width > 0 && a.innerText && a.innerText.toLowerCase().includes(keyword.toLowerCase()));
-              if (matchedNode) break;
-              await new Promise(r => setTimeout(r, 200));
-            }
-
-            if (!matchedNode) {
-              return { ok: false, error: `在 JumpServer 资产树中未找到匹配 "${keyword}" 的主机节点` };
-            }
-
-            // 点击节点触发连接
-            matchedNode.click();
-
-            // 监听并自动点击确认弹窗 (mat-dialog / modal)
-            const modalStartTime = Date.now();
-            while (Date.now() - modalStartTime < 2500) {
-              const dialog = document.querySelector("mat-dialog-container, .modal, .dialog");
-              if (dialog) {
-                const btns = Array.from(dialog.querySelectorAll("button"));
-                const confirmBtn = btns.find(b => b.innerText && (b.innerText.includes("确认") || b.innerText.includes("确定") || b.innerText.includes("OK")));
-                if (confirmBtn) {
-                  const rect = confirmBtn.getBoundingClientRect();
-                  const x = rect.left + rect.width / 2;
-                  const y = rect.top + rect.height / 2;
-                  const topEl = document.elementFromPoint(x, y) || confirmBtn.querySelector("span") || confirmBtn;
-                  ["mousedown", "mouseup", "click"].forEach(type => {
-                    topEl.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y }));
-                  });
-                  confirmBtn.click();
-                  break;
-                }
-              }
-              const activeTab = document.querySelector(".tabs li.active");
-              if (activeTab && activeTab.innerText.toLowerCase().includes(keyword.toLowerCase())) break;
-              await new Promise(r => setTimeout(r, 200));
-            }
-
-            // 等待新标签页渲染
-            await new Promise(r => setTimeout(r, 1500));
-            const finalTab = document.querySelector(".tabs li.active");
-            const title = finalTab ? (finalTab.getAttribute("title") || finalTab.innerText.replace("×", "").trim()) : keyword;
-            return { ok: true, title };
-          }
-        });
-
-        const r = createRes?.[0]?.result;
-        chrome.tabs.sendMessage(targetTab.id, {
-          action: "set_status",
-          payload: { text: "终端就绪", autoResetDelay: 2500 }
-        }).catch(() => {});
-
-        if (!r?.ok) {
-          ws.send(JSON.stringify({ id, result: `[连接失败] ${r?.error || "未知异常"}` }));
-        } else {
-          ws.send(JSON.stringify({ id, result: `[新开终端就绪] 已在 JumpServer 连接并切换至终端标签页: "${r.title}"` }));
-        }
-        return;
-      }
-
-      // ─── 动作 5: 常规 look / act（穿透至 content.js） ───
-      await ensureContentScript(targetTab.id);
-      const res = await chrome.tabs.sendMessage(targetTab.id, { action, payload });
-      ws.send(JSON.stringify({ id, result: res }));
+        // ─── 动作 5: 常规 look / act（穿透至 content.js） ───
+        await ensureContentScript(targetTab.id);
+        assertRequestActive();
+        const res = await chrome.tabs.sendMessage(targetTab.id, { action, payload });
+        ws.send(JSON.stringify({ id, result: res }));
+      });
 
     } catch (err) {
       console.error("[Extension] 处理异常:", err);
       // 关键：任何异常立即回包，彻底根除 CLI 15 秒挂死超时
-      if (msg && msg.id) {
-        ws.send(JSON.stringify({ id: msg.id, result: `[扩展执行异常] ${err.message}` }));
-      }
+      replyError(msg?.id, err, request);
     }
   };
 
   ws.onclose = () => {
+    for (const request of requests.values()) request.cancelled = true;
     isConnecting = false;
-    ws = null;
+    if (ws === socket) ws = null;
     setTimeout(connectWS, 2500);
   };
   ws.onerror = () => {
@@ -1141,8 +1247,16 @@ async function getTargetTab(sessionId, requireBound = false) {
   }
   // 未绑定时回退到当前活动窗口的标签页 (仅供 look/probe 等只读探测兜底使用)
   const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (activeTab) return activeTab;
+  if (activeTab) {
+    if (await getBindingOwner(activeTab.id, sessionKey)) {
+      throw new Error(`[会话隔离拦截] 当前前台标签页 [${activeTab.id}] 已由其它会话控制，请先使用 bctl tabs 和 bctl bind <TabID> 选择目标`);
+    }
+    return activeTab;
+  }
   const [anyActive] = await chrome.tabs.query({ active: true });
+  if (anyActive && await getBindingOwner(anyActive.id, sessionKey)) {
+    throw new Error(`[会话隔离拦截] 当前活动标签页 [${anyActive.id}] 已由其它会话控制，请先绑定目标`);
+  }
   return anyActive || null;
 }
 

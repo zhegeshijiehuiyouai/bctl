@@ -102,18 +102,47 @@ test("unbind only releases the calling session", async () => {
 test("rebinding a session releases its previous tab reference", async () => {
   const { api } = createBindingsApi();
   await api.bindSessionTab("agent-a", 5);
-  assert.equal(await api.bindSessionTab("agent-a", 9), 5);
+  assert.equal((await api.bindSessionTab("agent-a", 9)).previousTabId, 5);
   assert.equal(await api.getBoundTabId("agent-a"), 9);
 });
 
-test("closing a tab clears every session bound to it", async () => {
+test("closing a tab clears its binding and leaves other tabs alone", async () => {
   const { api } = createBindingsApi();
   await api.bindSessionTab("agent-a", 7);
-  await api.bindSessionTab("agent-b", 7);
+  await api.bindSessionTab("agent-b", 8);
 
-  assert.deepEqual(Array.from(await api.removeTabBindings(7)).sort(), ["agent-a", "agent-b"]);
+  assert.deepEqual(Array.from(await api.removeTabBindings(7)), ["agent-a"]);
   assert.equal(await api.getBoundTabId("agent-a"), null);
-  assert.equal(await api.getBoundTabId("agent-b"), null);
+  assert.equal(await api.getBoundTabId("agent-b"), 8);
+});
+
+test("concurrent claims for one tab have exactly one winner", async () => {
+  const { api } = createBindingsApi();
+  const results = await Promise.all([api.bindSessionTab("agent-a", 7), api.bindSessionTab("agent-b", 7)]);
+  assert.equal(results.filter(result => result.ok).length, 1);
+  assert.equal(Object.keys(await api.readSessionBindings()).length, 1);
+});
+
+test("force revokes the previous owner and a rejected claim preserves both bindings", async () => {
+  const { api } = createBindingsApi();
+  await api.bindSessionTab("agent-a", 7);
+  await api.bindSessionTab("agent-b", 8);
+  assert.equal((await api.bindSessionTab("agent-b", 7)).ok, false);
+  assert.equal(await api.getBoundTabId("agent-b"), 8);
+  const claim = await api.bindSessionTab("agent-b", 7, true);
+  assert.equal(claim.owner, "agent-a");
+  assert.equal(claim.previousTabId, 8);
+  assert.equal(await api.getBoundTabId("agent-a"), null);
+  assert.equal(await api.getBoundTabId("agent-b"), 7);
+});
+
+test("old duplicate tab owners are repaired when storage loads", async () => {
+  const { api } = createBindingsApi({ sessionBindings: {
+    "agent-old": { tabId: 7, lastActivity: 100 },
+    "agent-new": { tabId: 7, lastActivity: 200 }
+  } });
+  assert.equal(await api.getBoundTabId("agent-old"), null);
+  assert.equal(await api.getBoundTabId("agent-new"), 7);
 });
 
 test("legacy single-tab binding migrates into the default session", async () => {
