@@ -22,7 +22,7 @@ pwsh -NoProfile -File .\scripts\install-cli.ps1
 ## 工作流与命令速查
 
 1. **打开新页面**：用 `bctl new "<url>"` 在后台新建并自动绑定标签页。
-2. **接管已有页面 / 终端 / 控制台**：先 `bctl tabs` 查列表，再 `bctl bind <TabID>` 锁定目标（**强烈推荐优先使用纯数字 TabID 绑定**，避免多堡垒机/多实例通用关键词串台冲突；执行类命令未绑定时会自动安全拦截）。
+2. **接管已有页面 / 终端 / 控制台**：先 `bctl tabs` 查列表，再 `bctl bind <TabID>` 锁定目标（**强烈推荐优先使用纯数字 TabID 绑定**，避免多堡垒机/多实例通用关键词串台冲突；执行类命令未绑定时会自动安全拦截）。多个 Agent（Codex / Cursor / Claude / 同工具多窗口）同时使用时，每个会话各自持有独立绑定：`bctl tabs` 会标注归属会话，标签页被其它会话占用时绑定会被拦截，确需接管才使用 `bctl bind <TabID> --force`。
 3. **嗅探可交互能力**：如遇非标 Web 终端或复杂控制台，运行 `bctl probe` 快速探测终端与编辑器实例。
 4. **释放控制权**：所有网页操作完成后，**最后必须执行 `bctl unbind`**。
 
@@ -30,7 +30,8 @@ pwsh -NoProfile -File .\scripts\install-cli.ps1
 | :--- | :--- |
 | `bctl new "<url>"` | 后台新建标签页、自动绑定并返回页面元素摘要 |
 | `bctl tabs` | 列出所有标签页（TabID、标题、URL、绑定与前台状态） |
-| `bctl bind <TabID>` | 绑定指定标签页并关闭后台休眠；先用 `bctl tabs` 确认目标，执行类操作优先使用数字 TabID |
+| `bctl bind <TabID>` | 绑定指定标签页并关闭后台休眠；先用 `bctl tabs` 确认目标，执行类操作优先使用数字 TabID；被其它会话占用时需 `--force` 显式接管 |
+| `bctl session` | 查看本 Agent 自动识别的独立会话 ID（可用 `BCTL_SESSION` 环境变量覆盖） |
 | `bctl subtabs` / `terms` | 列出当前页面内嵌的终端标签列表与健康状态（支持 JumpServer 等多标签终端） |
 | `bctl switch <IP\|序号>` | 在当前页面直接切换到指定的内嵌终端标签页（如切浏览器标签一样无缝切换） |
 | `bctl connect <IP> [--new]` | 智能按需连接（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |

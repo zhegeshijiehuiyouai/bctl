@@ -23,6 +23,10 @@
 - **👥 双人并发与后台多标签隔离 (True Background Concurrency)**：
   - 使用 `bctl new <url>` 在后台静默创建标签页并自动绑定，前台人类正在浏览的网页**绝不切页、绝不夺取焦点**。
   - 大模型在后台标签页自由执行点击、滚动、表单提交，人类在前台正常打字聊天，互不干扰。
+- **🧭 多 Agent 会话隔离（Codex / Cursor / Claude 同开互不串台）**：
+  - 每次调用自动识别调用方会话：Codex 线程 ID、Claude/Cursor 等 Agent 会话变量、终端窗口、TTY、进程树依次判定；
+  - 每个会话独立保存自己的绑定标签页，同一工具开两个窗口也会得到两个独立会话；一个标签页同时只归属一个会话，被其它会话占用时显式拦截，需 `bctl bind <TabID> --force` 才能接管；
+  - 可用 `bctl session` 查看当前会话，或用 `BCTL_SESSION=<任意标识> bctl ...` 手动指定。
 - **⚡ 多类型 Web 终端发现与命令执行 (`bctl probe` / `bctl exec`)**：
   - 优先使用终端公开的输入/输出接口；其它页面根据可访问名称、可见提示符、焦点和输入控件结构形成候选。`probe` 返回候选 frame、编号、证据和置信度；只有目标唯一且证据充分时，`exec` 才会自动发送命令。无法唯一判断时，可用 `--target` 选择。
   - 能否覆盖新终端取决于页面是否暴露可读 DOM 或键盘输入节点。只绘制像素、没有可访问名称和输入节点的画布，浏览器扩展无法可靠判断画面里哪个位置是命令行；这类页面需要针对其公开接口做适配。
@@ -126,7 +130,8 @@ bctl status
 ```json
 {
   "daemon": true,
-  "extension_connected": true
+  "extension_connected": true,
+  "session": "claude:662c8be0-15fa-4364-9707-1124e50ea3f6"
 }
 ```
 
@@ -171,7 +176,8 @@ pwsh -NoProfile -File .\scripts\install-skill.ps1
 | :--- | :--- | :--- |
 | **查看标签页** | `bctl tabs` | 查看 Chrome 当前所有已打开的标签（包含 TabID、标题、URL、绑定状态） |
 | **后台打开网页** | `bctl new "https://github.com"` | **强烈推荐**：在后台静默创建标签页并自动绑定，前台人类视角 0 干扰 |
-| **锁定控制目标** | `bctl bind 947878209` | 将后续操作锁定在指定标签页；先用 `bctl tabs` 确认目标并优先使用数字 TabID |
+| **锁定控制目标** | `bctl bind 947878209` | 将后续操作锁定在指定标签页；先用 `bctl tabs` 确认目标并优先使用数字 TabID；标签页被其它会话占用时需加 `--force` 显式接管 |
+| **查看当前会话** | `bctl session` | 查看本 Agent 自动识别的会话 ID（可用 `BCTL_SESSION` 环境变量覆盖） |
 | **内嵌终端标签列表** | `bctl subtabs` (或 `terms`) | 查看当前页面内嵌的终端标签列表与连接健康状态 (JumpServer 等多标签终端) |
 | **内嵌终端标签切换** | `bctl switch <IP\|序号>` | 在当前页面像切浏览器标签一样直接切换内嵌终端，零重复新开 |
 | **智能按需连接** | `bctl connect <IP> [--new]` | 智能按需连接主机（优先复用已有未断开终端，断开自动重连，支持 `--new` 强制新开） |
@@ -188,6 +194,18 @@ pwsh -NoProfile -File .\scripts\install-skill.ps1
 | **解除控制恢复标签页** | `bctl unbind` (或 `release`) | 解除当前标签页控制，立即平滑淡出胶囊并复原原生 Tab 栏图标与标题 |
 | **热重载扩展** | `bctl reload` | 修改扩展代码后无需手动切扩展页面刷新，一键重载 |
 | **状态检查** | `bctl status` | 检查守护进程与 Chrome 扩展的实时连接状态 |
+
+### 多 Agent 并行（同一 Chrome，各操作各的标签页）
+
+```bash
+bctl session                  # 查看本会话 ID，如 codex:01a2108d-... 或 process:41234
+bctl tabs                     # 绑定状态会标注归属会话
+bctl bind 12345               # 本会话绑定；该标签页被其它会话占用时会被拦截
+bctl bind 12345 --force       # 明确要从其它会话手中接管时才使用
+bctl unbind                   # 只解除本会话的绑定
+```
+
+识别优先级：`BCTL_SESSION` > Agent 会话变量（`CODEX_SESSION_ID`、`CLAUDE_SESSION_ID`、`CURSOR_TRACE_ID` 等）> 终端窗口 ID > TTY > 进程树；都识别不到时归入 `default` 会话。同一会话内的命令串行执行，不同会话之间并行。
 
 ---
 

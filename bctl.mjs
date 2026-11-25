@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveClientSession } from "./lib/client-session.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -134,7 +135,7 @@ async function sendCommand(action, payload = {}, retries = 1) {
     const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/${action}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({ ...payload, sessionId: CLIENT_SESSION_ID })
     });
     const data = await res.json();
     if (!res.ok) {
@@ -177,6 +178,7 @@ function formatTerminalScreen(result) {
 // --- 3. 命令行入口 ---
 const args = process.argv.slice(2);
 const cmd = args[0];
+const CLIENT_SESSION_ID = cmd === "daemon" ? "daemon" : resolveClientSession();
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
   console.log(`
@@ -184,7 +186,8 @@ bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及
 
 命令列表:
   bctl tabs                查看所有已打开的标签页（列出 TabID、标题、URL）
-  bctl bind <ID或关键词>   将大模型控制目标锁定在指定标签页（后台并发，不夺取前台焦点）
+  bctl session             查看当前 Agent 的独立会话 ID（可用 BCTL_SESSION 环境变量覆盖）
+  bctl bind <ID或关键词> [--force]  将本会话控制目标锁定在指定标签页（后台并发，不夺取前台焦点；--force 可接管其它会话占用的标签页）
   bctl unbind / release    解除控制并释放绑定的标签页（立即平滑淡出胶囊并恢复原生 Tab 栏图标）
   bctl new <url>           在后台静默打开新标签页并自动绑定（人类前台零干扰）
   bctl open <url>          在当前绑定的标签页打开指定网址并返回元素列表
@@ -202,6 +205,11 @@ bctl - 极简日常 Chrome 控制工具 (支持 Web 终端与 DevTools 直连及
   bctl state "<描述>"      在受控页面顶部悬浮胶囊打印当前操作描述（如 "正在排查报警..."）
   bctl reload              热重载 Chrome 扩展（开发调试时刷新 content.js 与 background.js）
   bctl status              查看 Chrome 扩展与守护进程连接状态
+
+多 Agent 并发（互不串台）:
+  每个 Agent 会话自动隔离：Codex 线程 ID、Claude/Cursor 等会话变量、终端窗口、TTY、进程树依次判定。
+  不同会话各绑各的标签页并行操作；同一工具开两个窗口也会得到两个独立会话。
+  查看当前会话: bctl session      手动指定: BCTL_SESSION=my-agent bctl bind <TabID>
 
 使用场景:
   1. 后台操作堡垒机或自研 K8s 容器终端 (不影响你在前台浏览其它网页):
@@ -228,28 +236,32 @@ if (cmd === "daemon") {
   try {
     const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/status`);
     const data = await res.json();
-    console.log(JSON.stringify(data, null, 2));
+    console.log(JSON.stringify({ ...data, session: CLIENT_SESSION_ID }, null, 2));
   } catch (e) {
     ensureDaemonRunning();
     await new Promise(r => setTimeout(r, 1000));
     try {
       const res = await fetch(`http://127.0.0.1:${HTTP_PORT}/status`);
       const data = await res.json();
-      console.log(JSON.stringify(data, null, 2));
+      console.log(JSON.stringify({ ...data, session: CLIENT_SESSION_ID }, null, 2));
     } catch {
-      console.log(JSON.stringify({ daemon: false, extension_connected: false }, null, 2));
+      console.log(JSON.stringify({ daemon: false, extension_connected: false, session: CLIENT_SESSION_ID }, null, 2));
     }
   }
+} else if (cmd === "session") {
+  console.log(CLIENT_SESSION_ID);
 } else if (cmd === "tabs") {
   const result = await sendCommand("tabs");
   console.log(result);
 } else if (cmd === "bind") {
-  const target = args[1];
+  const bindArgs = args.slice(1).filter(a => a !== "--force" && a !== "-f");
+  const force = bindArgs.length !== args.slice(1).length;
+  const target = bindArgs[0];
   if (!target) {
-    console.error("用法: bctl bind <TabID 或 标题/URL关键词，如 jumpserver>");
+    console.error("用法: bctl bind <TabID 或 标题/URL关键词，如 jumpserver> [--force]");
     process.exit(1);
   }
-  const result = await sendCommand("bind", { target });
+  const result = await sendCommand("bind", { target, force });
   console.log(result);
 } else if (cmd === "subtabs" || cmd === "terms" || cmd === "term-tabs") {
   const result = await sendCommand("term_tabs");

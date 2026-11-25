@@ -3,6 +3,163 @@ const WS_URL = "ws://127.0.0.1:9223";
 
 const CONTROL_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 小时超时兜底（避免长任务/等待人工操作时误解绑）
 
+// ─── 多会话绑定逻辑 (SESSION-BINDINGS BEGIN) ───
+// 每个 Agent 会话（Codex 线程、Claude 会话、终端窗口、进程…）各自持有一个后台绑定，
+// 同一标签页最多归属一个会话，从而保证多个大模型并发操作互不串台。
+const DEFAULT_SESSION_ID = "default";
+const SESSION_BINDINGS_KEY = "sessionBindings";
+const LEGACY_BINDING_KEYS = ["boundTabId", "lastActivityTime"];
+
+function normalizeSessionId(value) {
+  const normalized = String(value ?? "").replace(/[\x00-\x1f\x7f]/g, "").trim().slice(0, 160);
+  return normalized || DEFAULT_SESSION_ID;
+}
+
+function sanitizeBindings(raw) {
+  const bindings = {};
+  if (!raw || typeof raw !== "object") return bindings;
+  for (const [sessionId, entry] of Object.entries(raw)) {
+    const tabId = Number(entry && typeof entry === "object" ? entry.tabId : entry);
+    if (!Number.isInteger(tabId) || tabId <= 0) continue;
+    bindings[normalizeSessionId(sessionId)] = {
+      tabId,
+      lastActivity: Number(entry && typeof entry === "object" ? entry.lastActivity : 0) || 0
+    };
+  }
+  return bindings;
+}
+
+let sessionBindingsCache = null;
+let sessionBindingsChain = Promise.resolve();
+
+async function loadSessionBindings() {
+  if (sessionBindingsCache) return sessionBindingsCache;
+  const stored = await chrome.storage.session.get([SESSION_BINDINGS_KEY, ...LEGACY_BINDING_KEYS]);
+  const bindings = sanitizeBindings(stored[SESSION_BINDINGS_KEY]);
+  // 兼容升级前的全局单绑定：归入默认会话，避免老标签页失联
+  if (stored.boundTabId && !bindings[DEFAULT_SESSION_ID]) {
+    bindings[DEFAULT_SESSION_ID] = {
+      tabId: Number(stored.boundTabId),
+      lastActivity: Number(stored.lastActivityTime) || Date.now()
+    };
+  }
+  sessionBindingsCache = bindings;
+  await chrome.storage.session.set({ [SESSION_BINDINGS_KEY]: bindings }).catch(() => {});
+  if (stored.boundTabId !== undefined || stored.lastActivityTime !== undefined) {
+    await chrome.storage.session.remove(LEGACY_BINDING_KEYS).catch(() => {});
+  }
+  return sessionBindingsCache;
+}
+
+async function readSessionBindings() {
+  await sessionBindingsChain.catch(() => {});
+  const bindings = await loadSessionBindings();
+  return { ...bindings };
+}
+
+async function mutateSessionBindings(mutator) {
+  const run = sessionBindingsChain.then(async () => {
+    const bindings = await loadSessionBindings();
+    const outcome = await mutator(bindings);
+    await chrome.storage.session.set({ [SESSION_BINDINGS_KEY]: bindings });
+    return outcome;
+  });
+  sessionBindingsChain = run.catch(() => {});
+  return run;
+}
+
+async function getBoundTabId(sessionId) {
+  const bindings = await readSessionBindings();
+  return bindings[normalizeSessionId(sessionId)]?.tabId ?? null;
+}
+
+async function getBindingOwner(tabId, sessionId) {
+  const bindings = await readSessionBindings();
+  const current = normalizeSessionId(sessionId);
+  for (const [owner, entry] of Object.entries(bindings)) {
+    if (owner !== current && entry.tabId === tabId) return owner;
+  }
+  return null;
+}
+
+async function bindSessionTab(sessionId, tabId) {
+  return mutateSessionBindings(bindings => {
+    const key = normalizeSessionId(sessionId);
+    const previousTabId = bindings[key]?.tabId ?? null;
+    bindings[key] = { tabId, lastActivity: Date.now() };
+    return previousTabId;
+  });
+}
+
+async function clearSessionBinding(sessionId) {
+  return mutateSessionBindings(bindings => {
+    const key = normalizeSessionId(sessionId);
+    const tabId = bindings[key]?.tabId ?? null;
+    delete bindings[key];
+    return tabId;
+  });
+}
+
+async function touchSession(sessionId) {
+  const key = normalizeSessionId(sessionId);
+  return mutateSessionBindings(bindings => {
+    if (bindings[key]) bindings[key] = { ...bindings[key], lastActivity: Date.now() };
+  });
+}
+
+async function takeStaleBindings(now = Date.now(), timeoutMs = CONTROL_TIMEOUT_MS) {
+  const bindings = await readSessionBindings();
+  const stale = Object.entries(bindings)
+    .filter(([, entry]) => entry.lastActivity && now - entry.lastActivity > timeoutMs)
+    .map(([sessionId, entry]) => ({ sessionId, tabId: entry.tabId }));
+  if (!stale.length) return [];
+  return mutateSessionBindings(current => {
+    const removed = [];
+    for (const { sessionId, tabId } of stale) {
+      if (current[sessionId]?.tabId === tabId) {
+        delete current[sessionId];
+        removed.push({ sessionId, tabId });
+      }
+    }
+    return removed;
+  });
+}
+
+async function removeTabBindings(tabId) {
+  return mutateSessionBindings(bindings => {
+    const removed = [];
+    for (const [sessionId, entry] of Object.entries(bindings)) {
+      if (entry.tabId === tabId) {
+        delete bindings[sessionId];
+        removed.push(sessionId);
+      }
+    }
+    return removed;
+  });
+}
+
+async function listBoundTabs() {
+  const bindings = await readSessionBindings();
+  const owners = new Map();
+  for (const [sessionId, entry] of Object.entries(bindings)) owners.set(entry.tabId, sessionId);
+  return owners;
+}
+
+// 同一会话的命令串行执行，不同会话并行，避免同一会话内的 bind/exec 互相踩踏
+const sessionTaskQueues = new Map();
+function enqueueSessionTask(sessionId, task) {
+  const key = normalizeSessionId(sessionId);
+  const previous = sessionTaskQueues.get(key) || Promise.resolve();
+  const run = previous.then(task, task);
+  const tail = run.catch(() => {});
+  sessionTaskQueues.set(key, tail);
+  tail.then(() => {
+    if (sessionTaskQueues.get(key) === tail) sessionTaskQueues.delete(key);
+  });
+  return run;
+}
+// ─── 多会话绑定逻辑 (SESSION-BINDINGS END) ───
+
 // 1. 保活报警器（MV3 Service Worker 闲置 30 秒休眠防断连，兼顾 2 小时闲置超时兜底）
 chrome.alarms.create("keepAlive", { periodInMinutes: 0.3 });
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -13,14 +170,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       ws.send(JSON.stringify({ type: "pong" }));
     }
 
-    // 2 小时超时兜底：检查是否超过 2 小时未收到大模型任何操作
+    // 2 小时超时兜底：逐个会话检查是否超过 2 小时未收到大模型任何操作
     try {
-      const { boundTabId, lastActivityTime } = await chrome.storage.session.get(["boundTabId", "lastActivityTime"]);
-      if (boundTabId && lastActivityTime && (Date.now() - lastActivityTime > CONTROL_TIMEOUT_MS)) {
-        console.log(`[bctl] 超过 2 小时无大模型操作，触发超时兜底自动解绑标签页: ${boundTabId}`);
-        chrome.tabs.sendMessage(boundTabId, { action: "hide_control_state" }).catch(() => {});
-        await chrome.tabs.update(boundTabId, { autoDiscardable: true }).catch(() => {});
-        await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
+      const expired = await takeStaleBindings(Date.now(), CONTROL_TIMEOUT_MS);
+      for (const { sessionId, tabId } of expired) {
+        console.log(`[bctl] 会话 ${sessionId} 超过 2 小时无操作，触发超时兜底自动解绑标签页: ${tabId}`);
+        chrome.tabs.sendMessage(tabId, { action: "hide_control_state" }).catch(() => {});
+        await chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {});
       }
     } catch (_) {}
   }
@@ -58,16 +214,33 @@ async function connectWS() {
     console.log("[Extension] 成功连接至本地 bctl 守护进程");
   };
 
-  ws.onmessage = async (e) => {
+  ws.onmessage = (e) => {
     let msg = null;
     try {
       msg = JSON.parse(e.data);
-      if (msg.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
-        return;
-      }
+    } catch (err) {
+      console.error("[Extension] 消息解析异常:", err);
+      return;
+    }
 
-      const { id, action, payload } = msg;
+    if (msg.type === "ping") {
+      ws.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
+
+    const sessionId = normalizeSessionId(msg.payload?.sessionId);
+    // 不同会话并行执行，同一会话内串行，避免并发命令互相踩踏
+    enqueueSessionTask(sessionId, () => handleMessage(msg)).catch((err) => {
+      console.error("[Extension] 处理异常:", err);
+      if (msg.id) ws.send(JSON.stringify({ id: msg.id, result: `[扩展执行异常] ${err.message}` }));
+    });
+  };
+
+  const handleMessage = async (msg) => {
+    try {
+      const { id, action } = msg;
+      const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
+      const sessionId = normalizeSessionId(payload.sessionId);
 
       if (action === "reload") {
         ws.send(JSON.stringify({ id, result: "Chrome 扩展已成功触发重载" }));
@@ -79,10 +252,13 @@ async function connectWS() {
 
       // ─── 动作 1: 列出所有标签页 (bctl tabs) ───
       if (action === "tabs") {
-        const { boundTabId } = await chrome.storage.session.get("boundTabId");
+        const owners = await listBoundTabs();
         const allTabs = await chrome.tabs.query({});
         const lines = allTabs.map(t => {
-          const isBound = t.id === boundTabId ? " [★ 绑定后台]" : "";
+          const owner = owners.get(t.id);
+          const isBound = owner
+            ? (owner === sessionId ? " [★ 本会话绑定]" : ` [★ 已被会话 ${owner} 绑定]`)
+            : "";
           const isActive = t.active ? " [当前前台]" : "";
           return `[${t.id}] ${t.title || "(无标题)"} (${t.url || "about:blank"})${isBound}${isActive}`;
         });
@@ -128,8 +304,22 @@ async function connectWS() {
           return;
         }
 
+        // 会话隔离：同一标签页只归属一个会话，防止两个 Agent 抢同一页面互相串台
+        const owner = await getBindingOwner(matchedTab.id, sessionId);
+        if (owner && !payload.force) {
+          ws.send(JSON.stringify({
+            id,
+            result: `[会话隔离拦截] 标签页 [${matchedTab.id}] "${matchedTab.title}" 当前由会话 "${owner}" 控制。\n如需接管，请让该会话先执行 bctl unbind，或使用 bctl bind ${matchedTab.id} --force 显式抢占。`
+          }));
+          return;
+        }
+
         // 保存至 session 存储，防止 Service Worker 唤醒时丢失，同时记录当前活跃时间戳
-        await chrome.storage.session.set({ boundTabId: matchedTab.id, lastActivityTime: Date.now() });
+        const previousTabId = await bindSessionTab(sessionId, matchedTab.id);
+        if (previousTabId && previousTabId !== matchedTab.id) {
+          chrome.tabs.sendMessage(previousTabId, { action: "hide_control_state" }).catch(() => {});
+          await chrome.tabs.update(previousTabId, { autoDiscardable: true }).catch(() => {});
+        }
         // 禁止 Chrome 后台休眠丢弃该标签页
         await chrome.tabs.update(matchedTab.id, { autoDiscardable: false }).catch(() => {});
         // 激活 ChatGPT 同款中央光标与控制胶囊 + Tab 图标光标
@@ -139,9 +329,10 @@ async function connectWS() {
           payload: { text: "AI Agent 已接管此标签页", autoResetDelay: 2500 }
         }).catch(() => {});
 
+        const takeoverNote = owner ? `\n已从会话 "${owner}" 显式接管该标签页。` : "";
         ws.send(JSON.stringify({
           id,
-          result: `已成功绑定目标标签页 [${matchedTab.id}] "${matchedTab.title}"\n后续操作将在该标签页后台独立运行，不抢占前台焦点！`
+          result: `已成功绑定目标标签页 [${matchedTab.id}] "${matchedTab.title}"（会话: ${sessionId}）${takeoverNote}\n后续操作将在该标签页后台独立运行，不抢占前台焦点！`
         }));
         return;
       }
@@ -149,7 +340,11 @@ async function connectWS() {
       // ─── 动作 2.5: 在后台静默打开新标签页 (bctl new <url>) ───
       if (action === "new") {
         const newTab = await chrome.tabs.create({ url: payload.url, active: false });
-        await chrome.storage.session.set({ boundTabId: newTab.id, lastActivityTime: Date.now() });
+        const previousTabId = await bindSessionTab(sessionId, newTab.id);
+        if (previousTabId && previousTabId !== newTab.id) {
+          chrome.tabs.sendMessage(previousTabId, { action: "hide_control_state" }).catch(() => {});
+          await chrome.tabs.update(previousTabId, { autoDiscardable: true }).catch(() => {});
+        }
         await chrome.tabs.update(newTab.id, { autoDiscardable: false }).catch(() => {});
 
         await waitForTabLoad(newTab.id);
@@ -165,18 +360,22 @@ async function connectWS() {
 
       // ─── 动作 2.6: 解除绑定与释放控制 (bctl unbind / bctl release) ───
       if (action === "unbind" || action === "release") {
-        const { boundTabId } = await chrome.storage.session.get("boundTabId");
-        if (boundTabId) {
-          chrome.tabs.sendMessage(boundTabId, { action: "hide_control_state" }).catch(() => {});
-          await chrome.tabs.update(boundTabId, { autoDiscardable: true }).catch(() => {});
-          await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
+        const releasedTabId = await clearSessionBinding(sessionId);
+        if (releasedTabId) {
+          chrome.tabs.sendMessage(releasedTabId, { action: "hide_control_state" }).catch(() => {});
+          await chrome.tabs.update(releasedTabId, { autoDiscardable: true }).catch(() => {});
         }
-        ws.send(JSON.stringify({ id, result: "已成功解除标签页绑定，指示胶囊与 Tab 栏图标已恢复正常" }));
+        ws.send(JSON.stringify({
+          id,
+          result: releasedTabId
+            ? `已解除会话 "${sessionId}" 对标签页 [${releasedTabId}] 的绑定，指示胶囊与 Tab 栏图标已恢复正常`
+            : `会话 "${sessionId}" 当前未绑定任何标签页`
+        }));
         return;
       }
 
-      // 刷新活跃时间戳
-      chrome.storage.session.set({ lastActivityTime: Date.now() }).catch(() => {});
+      // 刷新当前会话的活跃时间戳
+      touchSession(sessionId).catch(() => {});
 
       // 强校验：执行与终端交互类动作必须严格绑定后台标签页，严禁盲目降级回退到前台活动标签
       const REQUIRE_BOUND_ACTIONS = new Set([
@@ -194,12 +393,12 @@ async function connectWS() {
       ]);
 
       const needBound = REQUIRE_BOUND_ACTIONS.has(action);
-      const targetTab = await getTargetTab(needBound);
+      const targetTab = await getTargetTab(sessionId, needBound);
       if (!targetTab) {
         if (needBound) {
           ws.send(JSON.stringify({
             id,
-            result: `[安全拦截] 当前未绑定任何后台标签页！为防止向人类前台正在浏览的页面或其它终端误发命令，执行与终端交互类操作严禁未绑定运行。请先使用 bctl tabs 查看并用 bctl bind <TabID> 显式锁定目标。`
+            result: `[安全拦截] 会话 "${sessionId}" 当前未绑定任何后台标签页！为防止向人类前台正在浏览的页面或其它终端误发命令，执行与终端交互类操作严禁未绑定运行。请先使用 bctl tabs 查看并用 bctl bind <TabID> 显式锁定目标。`
           }));
           return;
         }
@@ -926,14 +1125,15 @@ async function connectWS() {
 }
 
 // 获取操作目标 Tab
-async function getTargetTab(requireBound = false) {
-  const { boundTabId } = await chrome.storage.session.get("boundTabId");
+async function getTargetTab(sessionId, requireBound = false) {
+  const sessionKey = normalizeSessionId(sessionId);
+  const boundTabId = await getBoundTabId(sessionKey);
   if (boundTabId) {
     try {
       const tab = await chrome.tabs.get(boundTabId);
       if (tab) return tab;
     } catch (e) {
-      await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
+      await clearSessionBinding(sessionKey);
     }
   }
   if (requireBound) {
@@ -1222,7 +1422,9 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
   }
 
   function sendRawToXterm(term, rawBytes) {
-    if (term._core?.coreService?.triggerDataEvent) {
+    if (term._clientSend) {
+      term._clientSend(rawBytes);
+    } else if (term._core?.coreService?.triggerDataEvent) {
       term._core.coreService.triggerDataEvent(rawBytes, true);
     } else if (typeof term.input === "function") {
       term.input(rawBytes);
@@ -1301,6 +1503,25 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
     consider(window.terminal);
     consider(window.xterm);
     consider(window._term);
+
+    // 支持 Dva / UmiJS / JumpServer H5 (window.g_app) Web 终端
+    try {
+      const conns = window.g_app?._store?.getState()?.operation_global?.clientConnections;
+      if (conns) {
+        for (const conn of Object.values(conns)) {
+          const client = conn?.connectionClient;
+          if (client) {
+            const core = typeof client.getCoreObject === "function" ? client.getCoreObject() : (client.term || client.terminal);
+            if (core) {
+              if (typeof client.sendTerminalData === "function") {
+                core._clientSend = (data) => client.sendTerminalData(data);
+              }
+              consider(core);
+            }
+          }
+        }
+      }
+    } catch (_) {}
 
     const scanEl = (el) => {
       if (!el) return;
@@ -1599,8 +1820,12 @@ async function executeInWebTerminal(cmd, timeoutMs, targetCandidateIndex = null,
         if (!settleTimer) checkBuffer();
       }, 150);
 
-      if (term._core?.coreService?.triggerDataEvent) {
+      if (term._clientSend) {
+        term._clientSend(rawInput);
+      } else if (term._core?.coreService?.triggerDataEvent) {
         term._core.coreService.triggerDataEvent(rawInput, true);
+      } else if (typeof term.input === "function") {
+        term.input(rawInput);
       } else {
         term.paste(rawInput);
       }
@@ -2417,20 +2642,17 @@ function probePageInteractiveCapabilities() {
 // 借鉴 ChatGPT handleTabActivated 机制：人类主动切入标签页时，平滑恢复正常
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
-    const { boundTabId } = await chrome.storage.session.get("boundTabId");
-    if (activeInfo.tabId === boundTabId) {
+    const owners = await listBoundTabs();
+    if (owners.has(activeInfo.tabId)) {
       chrome.tabs.sendMessage(activeInfo.tabId, { action: "hide_control_state" }).catch(() => {});
     }
   } catch (_) {}
 });
 
-// 标签页关闭时清理 session 中的绑定 ID
+// 标签页关闭时清理所有会话对它的绑定
 chrome.tabs.onRemoved.addListener(async (closedTabId) => {
   try {
-    const { boundTabId } = await chrome.storage.session.get("boundTabId");
-    if (closedTabId === boundTabId) {
-      await chrome.storage.session.remove(["boundTabId", "lastActivityTime"]);
-    }
+    await removeTabBindings(closedTabId);
   } catch (_) {}
 });
 
