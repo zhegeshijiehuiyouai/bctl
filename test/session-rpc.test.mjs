@@ -11,8 +11,36 @@ test("simultaneous bind RPCs have one winner without force", async () => {
   const extension = await makeExtension();
   const replies = await Promise.all([bind(extension, "agent-a"), bind(extension, "agent-b")]);
   assert.equal(replies.filter(reply => reply.result?.includes("已成功绑定")).length, 1);
-  assert.equal(replies.filter(reply => reply.result?.includes("会话隔离拦截")).length, 1);
+  assert.equal(replies.filter(reply => reply.code === "BCTL_SESSION_CONFLICT").length, 1);
   assert.equal(Object.keys(extension.store.sessionBindings).length, 1);
+});
+
+test("a rejected bind is a protocol failure and does not redirect the caller's next action", async () => {
+  const extension = await makeExtension();
+  const daemon = makeDaemon(extension);
+  await daemon.request("bind", { sessionId: "agent-a", target: 101 });
+  await daemon.request("bind", { sessionId: "agent-b", target: 202 });
+
+  const rejected = await daemon.request("bind", { sessionId: "agent-a", target: 202 });
+  assert.equal(rejected.status, 500);
+  assert.equal(rejected.body.code, "BCTL_SESSION_CONFLICT");
+
+  const acted = await daemon.request("act", act("agent-a", "stay on owned tab"));
+  assert.equal(acted.status, 200);
+  assert.equal(extension.messages.find(message => message.action === "act").tabId, 101);
+});
+
+test("missing and ambiguous bind targets fail instead of returning success", async () => {
+  const extension = await makeExtension();
+  const daemon = makeDaemon(extension);
+
+  const missing = await daemon.request("bind", { sessionId: "agent-a", target: 999 });
+  assert.equal(missing.status, 500);
+  assert.equal(missing.body.code, "BCTL_TARGET_NOT_FOUND");
+
+  const ambiguous = await daemon.request("bind", { sessionId: "agent-a", target: "example.test" });
+  assert.equal(ambiguous.status, 500);
+  assert.equal(ambiguous.body.code, "BCTL_TARGET_AMBIGUOUS");
 });
 
 test("force revokes old access and old unbind cannot alter the new owner's tab", async () => {
@@ -83,6 +111,22 @@ test("unbound look remains available on an unclaimed active tab", async () => {
   const reply = await extension.send("look", { sessionId: "reader" });
   assert.equal(reply.result, "ok");
   assert.equal(extension.messages.find(message => message.action === "look").tabId, 101);
+});
+
+test("eval and state require an explicitly bound tab", async () => {
+  const extension = await makeExtension();
+  const daemon = makeDaemon(extension);
+  for (const [action, payload] of [
+    ["eval", { sessionId: "writer", code: "window.changed = true" }],
+    ["state", { sessionId: "writer", text: "changed" }]
+  ]) {
+    const reply = await daemon.request(action, payload);
+    assert.equal(reply.status, 500);
+    assert.equal(reply.body.code, "BCTL_BINDING_REQUIRED");
+    assert.match(reply.body.error, /安全拦截/);
+  }
+  assert.equal(extension.scripts.length, 0);
+  assert.equal(extension.messages.length, 0);
 });
 
 test("fallback ownership is rechecked after waiting for the tab lock", async () => {
@@ -196,6 +240,35 @@ test("force that expires waiting for the tab cannot steal ownership", async () =
   assert.equal((await takeover).code, "BCTL_REQUEST_EXPIRED");
   assert.equal(extension.store.sessionBindings["agent-a"].tabId, 101);
   assert.equal(extension.store.sessionBindings["agent-b"], undefined);
+});
+
+test("force that expires waiting for binding storage cannot steal ownership", async () => {
+  const gate = deferred(), started = deferred();
+  let block = false;
+  const extension = await makeExtension({ onSet: async () => {
+    if (!block) return;
+    block = false;
+    started.resolve();
+    await gate.promise;
+  } });
+  await bind(extension, "agent-a", 101);
+  await bind(extension, "agent-b", 202);
+
+  block = true;
+  const storageTask = vm.runInContext('touchSession("agent-b")', extension.context);
+  await started.promise;
+  const takeover = extension.dispatch("bind", { sessionId: "agent-c", target: 101, force: true }, {
+    expiresAt: extension.clock.now + 100
+  });
+  await flush();
+  await extension.clock.advance(100);
+  extension.cancel(takeover.id);
+
+  gate.resolve();
+  await storageTask;
+  assert.equal((await takeover.promise).code, "BCTL_RESULT_UNKNOWN");
+  assert.equal(extension.store.sessionBindings["agent-a"].tabId, 101);
+  assert.equal(extension.store.sessionBindings["agent-c"], undefined);
 });
 
 test("disconnect rejects pending RPCs and prevents queued commands from executing", async () => {

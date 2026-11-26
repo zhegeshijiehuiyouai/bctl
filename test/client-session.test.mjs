@@ -41,6 +41,14 @@ test("falls back to the terminal window, then the tty, then the process tree", (
   );
 });
 
+test("tmux panes stay isolated even when they share an outer terminal session", () => {
+  const first = resolve({ env: { TERM_SESSION_ID: "outer-window", TMUX_PANE: "%1" } });
+  const second = resolve({ env: { TERM_SESSION_ID: "outer-window", TMUX_PANE: "%2" } });
+  assert.equal(first, "terminal:%1");
+  assert.equal(second, "terminal:%2");
+  assert.notEqual(first, second);
+});
+
 test("ignores a tty that is not attached", () => {
   assert.equal(resolve({ tty: "not a tty", ancestry: [] }), "default");
 });

@@ -74,10 +74,13 @@ async function readSessionBindings() {
   return { ...bindings };
 }
 
-async function mutateSessionBindings(mutator) {
+async function mutateSessionBindings(mutator, assertActive = null) {
   const run = sessionBindingsChain.then(async () => {
+    assertActive?.();
     const bindings = { ...await loadSessionBindings() };
+    assertActive?.();
     const outcome = await mutator(bindings);
+    assertActive?.();
     await chrome.storage.session.set({ [SESSION_BINDINGS_KEY]: bindings });
     sessionBindingsCache = bindings;
     return outcome;
@@ -100,7 +103,7 @@ async function getBindingOwner(tabId, sessionId) {
   return null;
 }
 
-async function bindSessionTab(sessionId, tabId, force = false) {
+async function bindSessionTab(sessionId, tabId, force = false, assertActive = null) {
   return mutateSessionBindings(bindings => {
     const key = normalizeSessionId(sessionId);
     const owner = Object.keys(bindings).find(other => other !== key && bindings[other].tabId === tabId);
@@ -111,7 +114,7 @@ async function bindSessionTab(sessionId, tabId, force = false) {
     }
     bindings[key] = { tabId, lastActivity: Date.now() };
     return { ok: true, owner: owner || null, previousTabId };
-  });
+  }, assertActive);
 }
 
 async function clearSessionBinding(sessionId) {
@@ -349,8 +352,9 @@ async function connectWS() {
           const targetId = parseInt(rawTarget, 10);
           matchedTab = allTabs.find(t => t.id === targetId);
           if (!matchedTab) {
-            ws.send(JSON.stringify({ id, result: `未找到 TabID 为 [${targetId}] 的标签页，请先运行 bctl tabs 查看当前可用标签页` }));
-            return;
+            throw Object.assign(new Error(`未找到 TabID 为 [${targetId}] 的标签页，请先运行 bctl tabs 查看当前可用标签页`), {
+              code: "BCTL_TARGET_NOT_FOUND"
+            });
           }
         } else if (rawTarget) {
           // 2. 输入为关键词，按标题/URL 模糊匹配；若匹配到多个则报错拦截，彻底杜绝串台
@@ -361,24 +365,23 @@ async function connectWS() {
 
           if (matchedTabs.length > 1) {
             const listStr = matchedTabs.map(t => `  - [${t.id}] ${t.title || "(无标题)"} (${t.url || ""})`).join("\n");
-            ws.send(JSON.stringify({
-              id,
-              result: `[多实例冲突拦截] 关键词 "${rawTarget}" 匹配到 ${matchedTabs.length} 个标签页！为防止串台误操作，请使用精准 TabID 绑定：\n${listStr}\n\n示例: bctl bind ${matchedTabs[0].id}`
-            }));
-            return;
+            throw Object.assign(new Error(`[多实例冲突拦截] 关键词 "${rawTarget}" 匹配到 ${matchedTabs.length} 个标签页！为防止串台误操作，请使用精准 TabID 绑定：\n${listStr}\n\n示例: bctl bind ${matchedTabs[0].id}`), {
+              code: "BCTL_TARGET_AMBIGUOUS"
+            });
           }
           matchedTab = matchedTabs[0] || null;
         }
 
         if (!matchedTab) {
-          ws.send(JSON.stringify({ id, result: `未找到匹配 "${rawTarget}" 的标签页，请先运行 bctl tabs 查看当前标签列表` }));
-          return;
+          throw Object.assign(new Error(`未找到匹配 "${rawTarget}" 的标签页，请先运行 bctl tabs 查看当前标签列表`), {
+            code: "BCTL_TARGET_NOT_FOUND"
+          });
         }
 
         // 会话隔离：同一标签页只归属一个会话，防止两个 Agent 抢同一页面互相串台
         const binding = await enqueueTabTask(matchedTab.id, async () => {
           startRequest();
-          const claimed = await bindSessionTab(sessionId, matchedTab.id, payload.force === true);
+          const claimed = await bindSessionTab(sessionId, matchedTab.id, payload.force === true, assertRequestActive);
           if (!claimed.ok) return claimed;
           await chrome.tabs.update(matchedTab.id, { autoDiscardable: false }).catch(() => {});
           await ensureContentScript(matchedTab.id);
@@ -390,11 +393,9 @@ async function connectWS() {
         });
         const { owner, previousTabId } = binding;
         if (!binding.ok) {
-          ws.send(JSON.stringify({
-            id,
-            result: `[会话隔离拦截] 标签页 [${matchedTab.id}] "${matchedTab.title}" 当前由会话 "${owner}" 控制。\n如需接管，请让该会话先执行 bctl unbind，或使用 bctl bind ${matchedTab.id} --force 显式抢占。`
-          }));
-          return;
+          throw Object.assign(new Error(`[会话隔离拦截] 标签页 [${matchedTab.id}] "${matchedTab.title}" 当前由会话 "${owner}" 控制。\n如需接管，请让该会话先执行 bctl unbind，或使用 bctl bind ${matchedTab.id} --force 显式抢占。`), {
+            code: "BCTL_SESSION_CONFLICT"
+          });
         }
 
         if (previousTabId && previousTabId !== matchedTab.id) {
@@ -467,7 +468,10 @@ async function connectWS() {
         "subtabs",
         "term_screen",
         "term_key",
-        "term_start"
+        "term_start",
+        "eval",
+        "state",
+        "set_status"
       ]);
 
       const needBound = REQUIRE_BOUND_ACTIONS.has(action);
@@ -475,11 +479,9 @@ async function connectWS() {
       const targetTab = await getTargetTab(sessionId, needBound);
       if (!targetTab) {
         if (needBound) {
-          ws.send(JSON.stringify({
-            id,
-            result: `[安全拦截] 会话 "${sessionId}" 当前未绑定任何后台标签页！为防止向人类前台正在浏览的页面或其它终端误发命令，执行与终端交互类操作严禁未绑定运行。请先使用 bctl tabs 查看并用 bctl bind <TabID> 显式锁定目标。`
-          }));
-          return;
+          throw Object.assign(new Error(`[安全拦截] 会话 "${sessionId}" 当前未绑定任何后台标签页！为防止向人类前台正在浏览的页面或其它终端误发命令，执行与终端交互类操作严禁未绑定运行。请先使用 bctl tabs 查看并用 bctl bind <TabID> 显式锁定目标。`), {
+            code: "BCTL_BINDING_REQUIRED"
+          });
         }
         ws.send(JSON.stringify({ id, result: "未找到可用标签页！请先执行 bctl tabs 查看并用 bctl bind 绑定" }));
         return;
