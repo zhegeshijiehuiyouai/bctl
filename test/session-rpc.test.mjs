@@ -129,6 +129,18 @@ test("eval and state require an explicitly bound tab", async () => {
   assert.equal(extension.messages.length, 0);
 });
 
+test("terminal mutation aliases require the same explicit binding as canonical actions", async () => {
+  const extension = await makeExtension();
+  const daemon = makeDaemon(extension);
+  for (const action of ["term_switch", "subswitch", "term_connect", "jump"]) {
+    const reply = await daemon.request(action, { sessionId: "writer", target: "first" });
+    assert.equal(reply.status, 500);
+    assert.equal(reply.body.code, "BCTL_BINDING_REQUIRED");
+  }
+  assert.equal(extension.scripts.length, 0);
+  assert.equal(extension.messages.length, 0);
+});
+
 test("fallback ownership is rechecked after waiting for the tab lock", async () => {
   const gate = deferred();
   const extension = await makeExtension();

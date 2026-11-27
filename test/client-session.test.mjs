@@ -42,15 +42,44 @@ test("falls back to the terminal window, then the tty, then the process tree", (
 });
 
 test("tmux panes stay isolated even when they share an outer terminal session", () => {
-  const first = resolve({ env: { TERM_SESSION_ID: "outer-window", TMUX_PANE: "%1" } });
-  const second = resolve({ env: { TERM_SESSION_ID: "outer-window", TMUX_PANE: "%2" } });
-  assert.equal(first, "terminal:%1");
-  assert.equal(second, "terminal:%2");
+  const tmux = "/tmp/tmux-1000/default,101,0";
+  const first = resolve({ env: { TERM_SESSION_ID: "outer-window", TMUX: tmux, TMUX_PANE: "%1" } });
+  const second = resolve({ env: { TERM_SESSION_ID: "outer-window", TMUX: tmux, TMUX_PANE: "%2" } });
+  assert.match(first, /^terminal:tmux:%1:/);
+  assert.match(second, /^terminal:tmux:%2:/);
   assert.notEqual(first, second);
+});
+
+test("the same tmux pane number on different servers stays isolated", () => {
+  const first = resolve({ env: { TMUX: "/tmp/tmux-1000/work,101,0", TMUX_PANE: "%0" } });
+  const second = resolve({ env: { TMUX: "/tmp/tmux-1000/personal,202,0", TMUX_PANE: "%0" } });
+  assert.notEqual(first, second);
+});
+
+test("window-scoped terminal ids are subdivided by tty", () => {
+  const first = resolve({ env: { WT_SESSION: "shared-window" }, tty: "/dev/pts/1" });
+  const second = resolve({ env: { WT_SESSION: "shared-window" }, tty: "/dev/pts/2" });
+  assert.equal(first, "terminal:shared-window:tty:/dev/pts/1");
+  assert.equal(second, "terminal:shared-window:tty:/dev/pts/2");
+  assert.notEqual(first, second);
+});
+
+test("window-scoped terminal ids use the shell when no tty is available", () => {
+  const first = resolve({
+    env: { WT_SESSION: "shared-window" },
+    ancestry: [{ pid: 41, ppid: 1, command: "pwsh.exe" }]
+  });
+  const second = resolve({
+    env: { WT_SESSION: "shared-window" },
+    ancestry: [{ pid: 42, ppid: 1, command: "pwsh.exe" }]
+  });
+  assert.equal(first, "terminal:shared-window:shell:41");
+  assert.equal(second, "terminal:shared-window:shell:42");
 });
 
 test("ignores a tty that is not attached", () => {
   assert.equal(resolve({ tty: "not a tty", ancestry: [] }), "default");
+  assert.equal(resolve({ env: { TMUX_PANE: "%0" }, tty: "not a tty", ancestry: [] }), "terminal:%0");
 });
 
 test("strips control characters and caps the session id length", () => {

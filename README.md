@@ -24,7 +24,7 @@
   - 使用 `bctl new <url>` 在后台静默创建标签页并自动绑定，前台人类正在浏览的网页**绝不切页、绝不夺取焦点**。
   - 大模型在后台标签页自由执行点击、滚动、表单提交，人类在前台正常打字聊天，互不干扰。
 - **🧭 多 Agent 会话隔离（Codex / Cursor / Claude 同开互不串台）**：
-  - 每次调用自动识别调用方会话：Codex 线程 ID、Claude/Cursor 等 Agent 会话变量、终端窗口、TTY、进程树依次判定；
+  - 每次调用自动识别调用方会话：Codex 线程 ID、Claude/Cursor 等 Agent 会话变量、tmux server 与窗格、终端窗口结合 TTY/shell、进程树依次判定；
   - 每个会话独立保存自己的绑定标签页，同一工具开两个窗口也会得到两个独立会话；一个标签页同时只归属一个会话，被其它会话占用时返回失败并由 CLI 非零退出，需 `bctl bind <TabID> --force` 才能接管；
   - 可用 `bctl session` 查看当前会话，或用 `BCTL_SESSION=<任意标识> bctl ...` 手动指定。
 - **⚡ 多类型 Web 终端发现与命令执行 (`bctl probe` / `bctl exec`)**：
@@ -205,7 +205,7 @@ bctl bind 12345 --force       # 明确要从其它会话手中接管时才使用
 bctl unbind                   # 只解除本会话的绑定
 ```
 
-识别优先级：`BCTL_SESSION` > Agent 会话变量（`CODEX_SESSION_ID`、`CLAUDE_SESSION_ID`、`CURSOR_TRACE_ID` 等）> 终端窗口 ID > TTY > 进程树；都识别不到时归入 `default` 会话。同一会话内的命令串行执行，不同会话之间并行。
+识别优先级：`BCTL_SESSION` > Agent 会话变量（`CODEX_SESSION_ID`、`CLAUDE_SESSION_ID`、`CURSOR_TRACE_ID` 等）> tmux server + pane / 终端窗格 ID > 终端窗口 ID（窗口级标识结合 TTY 或 shell 进程细分）> TTY > 进程树；都识别不到时归入 `default` 会话。同一会话内的命令串行执行，不同会话之间并行。
 
 同一标签页的操作与绑定切换会串行执行。`--force` 会等待该标签页正在执行的操作完成，再撤销原会话绑定；原会话后续命令不能继续操作该标签页。未绑定的 `look` / `probe` 也不会进入其它会话控制的前台标签页。
 

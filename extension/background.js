@@ -1,5 +1,9 @@
 let ws = null;
 const WS_URL = "ws://127.0.0.1:9223";
+const ACTION_ALIASES = new Map([
+  ["subswitch", "term_switch"],
+  ["jump", "term_connect"]
+]);
 
 const CONTROL_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 小时超时兜底（避免长任务/等待人工操作时误解绑）
 
@@ -310,7 +314,8 @@ async function connectWS() {
     };
     try {
       assertRequestActive();
-      const { id, action } = msg;
+      const { id } = msg;
+      const action = ACTION_ALIASES.get(msg.action) || msg.action;
       const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
       const sessionId = normalizeSessionId(payload.sessionId);
 
